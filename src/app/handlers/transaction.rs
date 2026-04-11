@@ -1,6 +1,4 @@
-use crate::app::{
-    command::ParsedCommand, AppContext, ConnectionState, RespValue,
-};
+use crate::app::{command::ParsedCommand, AppContext, ConnectionState, RespValue};
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::Notify;

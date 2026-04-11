@@ -64,7 +64,9 @@ fn handle_xadd(
             }
             Err(e) => RespValue::Error(Bytes::from(e.to_string())),
         },
-        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        _ => RespValue::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     }
 }
 
@@ -109,7 +111,9 @@ fn handle_xrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
                 }
                 Err(e) => RespValue::Error(Bytes::from(e.to_string())),
             },
-            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            _ => RespValue::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         _ => RespValue::Array(vec![]),
     }
@@ -176,7 +180,9 @@ async fn handle_xread(
                 match store.db().get(key) {
                     Some(entry) if !store.is_expired(&entry) => {
                         if let DataType::Stream(s) = &entry.data {
-                            s.last_id().map(|id| id.to_string()).unwrap_or_else(|| "0-0".to_string())
+                            s.last_id()
+                                .map(|id| id.to_string())
+                                .unwrap_or_else(|| "0-0".to_string())
                         } else {
                             "0-0".to_string()
                         }
@@ -200,12 +206,10 @@ async fn handle_xread(
         for (key, id_spec) in keys_and_ids {
             let stream_data = match store.db().get(*key) {
                 Some(entry) if !store.is_expired(&entry) => match &entry.data {
-                    DataType::Stream(stream) => {
-                        match stream.read_from(id_spec) {
-                            Ok(entries) if !entries.is_empty() => Some(((*key).clone(), entries)),
-                            _ => None,
-                        }
-                    }
+                    DataType::Stream(stream) => match stream.read_from(id_spec) {
+                        Ok(entries) if !entries.is_empty() => Some(((*key).clone(), entries)),
+                        _ => None,
+                    },
                     _ => return Err(crate::app::error::WRONGTYPE_ERROR),
                 },
                 _ => None,
@@ -214,7 +218,11 @@ async fn handle_xread(
                 results.push(data);
             }
         }
-        if results.is_empty() { Ok(None) } else { Ok(Some(results)) }
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
     };
 
     if let Ok(Some(results)) = perform_read(store, &keys_and_ids) {

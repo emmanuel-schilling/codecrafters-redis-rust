@@ -57,11 +57,8 @@ async fn main() -> Result<()> {
     if ctx.replication.role() == app::replication::Role::Replica {
         let master_addr = ctx.config.replicaof.clone().unwrap();
         info!("Running in replica mode, will connect to master at {master_addr}");
-        let repl_task = app::replication::start_replica_mode(
-            master_addr,
-            ctx.config.port,
-            Arc::clone(&ctx),
-        );
+        let repl_task =
+            app::replication::start_replica_mode(master_addr, ctx.config.port, Arc::clone(&ctx));
         tokio::spawn(repl_task);
     }
 

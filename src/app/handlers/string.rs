@@ -71,7 +71,9 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
             } else {
                 match &entry.data {
                     DataType::String(s) => RespValue::BulkString(s.clone()),
-                    _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+                    _ => RespValue::Error(Bytes::from_static(
+                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                    )),
                 }
             }
         }
@@ -93,15 +95,24 @@ fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
 
     match &mut entry.value_mut().data {
         DataType::String(bytes) => {
-            let current_val = match std::str::from_utf8(bytes).ok().and_then(|s| s.parse::<i64>().ok()) {
+            let current_val = match std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
                 Some(v) => v,
-                None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+                None => {
+                    return RespValue::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))
+                }
             };
 
             let new_val = current_val + 1;
             *bytes = Bytes::from(new_val.to_string());
             RespValue::Integer(new_val)
         }
-        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        _ => RespValue::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     }
 }

@@ -60,7 +60,9 @@ fn handle_push(
             }
             RespValue::Integer(len as i64)
         }
-        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        _ => RespValue::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     }
 }
 
@@ -104,7 +106,9 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
                 RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect())
             }
         }
-        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        _ => RespValue::Error(Bytes::from_static(
+            b"WRONGTYPE Operation against a key holding the wrong kind of value",
+        )),
     }
 }
 
@@ -152,7 +156,10 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
     };
 
     if let Some((key, value)) = try_pop(store, keys) {
-        return RespValue::Array(vec![RespValue::BulkString(key), RespValue::BulkString(value)]);
+        return RespValue::Array(vec![
+            RespValue::BulkString(key),
+            RespValue::BulkString(value),
+        ]);
     }
 
     let timeout = if timeout_secs == 0.0 {
@@ -164,7 +171,10 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
     waiters.wait_for_any(keys, timeout).await;
 
     if let Some((key, value)) = try_pop(store, keys) {
-        RespValue::Array(vec![RespValue::BulkString(key), RespValue::BulkString(value)])
+        RespValue::Array(vec![
+            RespValue::BulkString(key),
+            RespValue::BulkString(value),
+        ])
     } else {
         RespValue::NullArray
     }
@@ -177,7 +187,9 @@ fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
     match store.db().get(key) {
         Some(entry) if !store.is_expired(&entry) => match &entry.data {
             DataType::List(list) => RespValue::Integer(list.len() as i64),
-            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            _ => RespValue::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         _ => RespValue::Integer(0),
     }
@@ -233,7 +245,9 @@ fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
                     .collect();
                 RespValue::Array(items)
             }
-            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            _ => RespValue::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         _ => RespValue::Array(vec![]),
     }

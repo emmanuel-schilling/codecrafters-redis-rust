@@ -136,7 +136,9 @@ fn handle_geodist(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     };
 
     match (pos1, pos2) {
-        (Some(c1), Some(c2)) => RespValue::BulkString(Bytes::from(format!("{:.4}", geo::distance(c1, c2)))),
+        (Some(c1), Some(c2)) => {
+            RespValue::BulkString(Bytes::from(format!("{:.4}", geo::distance(c1, c2))))
+        }
         _ => RespValue::NullBulkString,
     }
 }
@@ -220,7 +222,9 @@ fn handle_geosearch(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
                 }
                 RespValue::Array(results)
             }
-            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+            _ => RespValue::Error(Bytes::from_static(
+                b"WRONGTYPE Operation against a key holding the wrong kind of value",
+            )),
         },
         _ => RespValue::Array(vec![]),
     }

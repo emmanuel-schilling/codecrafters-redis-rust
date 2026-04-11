@@ -265,14 +265,8 @@ pub async fn handle_command(
     queue: &mut Vec<ParsedCommand>,
     wait_notify: &Arc<Notify>,
 ) -> RespValue {
-    if let Some(response) = handlers::transaction::handle_state(
-        parsed.clone(),
-        state,
-        queue,
-        ctx,
-        wait_notify,
-    )
-    .await
+    if let Some(response) =
+        handlers::transaction::handle_state(parsed.clone(), state, queue, ctx, wait_notify).await
     {
         return response;
     }

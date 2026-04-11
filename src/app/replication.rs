@@ -134,11 +134,7 @@ impl ReplicationState {
     }
 }
 
-pub async fn start_replica_mode(
-    master_addr: String,
-    listening_port: u16,
-    ctx: Arc<AppContext>,
-) {
+pub async fn start_replica_mode(master_addr: String, listening_port: u16, ctx: Arc<AppContext>) {
     let corrected_addr = master_addr.replace(' ', ":");
     info!("Attempting to connect to master at {}", corrected_addr);
 
@@ -238,13 +234,25 @@ async fn perform_handshake(
                 let cmd = parsed_command.command();
                 let is_write = matches!(
                     cmd,
-                    Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr | Command::XAdd | Command::ZAdd | Command::ZRem | Command::GeoAdd
+                    Command::Set
+                        | Command::LPush
+                        | Command::RPush
+                        | Command::LPop
+                        | Command::Incr
+                        | Command::XAdd
+                        | Command::ZAdd
+                        | Command::ZRem
+                        | Command::GeoAdd
                 );
 
                 if is_write {
                     let response = crate::app::apply_command(&ctx, parsed_command.clone()).await;
                     if let RespValue::Error(e) = response {
-                        warn!("Replica failed to apply write command {:?}: {}", cmd, String::from_utf8_lossy(&e));
+                        warn!(
+                            "Replica failed to apply write command {:?}: {}",
+                            cmd,
+                            String::from_utf8_lossy(&e)
+                        );
                     }
                 }
 
