@@ -140,7 +140,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
             ref mut rx,
         } = state
         {
-            if handlers::pubsub::subscribed_loop(
+            handlers::pubsub::subscribed_loop(
                 &mut framed,
                 subscriptions,
                 tx,
@@ -148,13 +148,10 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                 &ctx.pubsub,
                 client_id,
             )
-            .await
-            .is_err()
-            {
-                info!("Client {client_id} disconnected from subscribed mode.");
-                ctx.pubsub.unsubscribe_all(client_id, subscriptions);
-                return;
-            }
+            .await;
+            info!("Client {client_id} disconnected from subscribed mode.");
+            ctx.pubsub.unsubscribe_all(client_id, subscriptions);
+            return;
         }
 
         match framed.next().await {

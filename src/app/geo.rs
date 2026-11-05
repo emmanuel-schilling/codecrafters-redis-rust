@@ -302,6 +302,13 @@ mod tests {
             ("SouthPole-Boundary", 0.0, MIN_LATITUDE),
         ];
 
+        // `decode` returns the centre of the 2^26 x 2^26 grid cell the input
+        // falls in, so a round trip is off by at most half a cell per axis.
+        // The small slack absorbs floating-point rounding at exactly half a cell.
+        const SLACK: f64 = 1e-12;
+        let lon_tolerance = LONGITUDE_RANGE / 2.0_f64.powi(27) + SLACK;
+        let lat_tolerance = LATITUDE_RANGE / 2.0_f64.powi(27) + SLACK;
+
         for (name, longitude, latitude) in boundary_cases {
             let score = encode(latitude, longitude);
             let decoded = decode(score);
@@ -310,12 +317,12 @@ mod tests {
             let lat_diff = (decoded.latitude - latitude).abs();
 
             assert!(
-                lon_diff < PRECISION,
+                lon_diff <= lon_tolerance,
                 "Longitude round-trip failed for boundary case '{}': expected {}, got {} (diff: {})",
                 name, longitude, decoded.longitude, lon_diff
             );
             assert!(
-                lat_diff < PRECISION,
+                lat_diff <= lat_tolerance,
                 "Latitude round-trip failed for boundary case '{}': expected {}, got {} (diff: {})",
                 name,
                 latitude,

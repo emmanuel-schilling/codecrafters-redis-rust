@@ -40,15 +40,17 @@ fn handle_xadd(
     };
 
     let fields_and_values = parsed.args_from(2);
-    if fields_and_values.is_empty() || fields_and_values.len() % 2 != 0 {
+    if fields_and_values.is_empty() || !fields_and_values.len().is_multiple_of(2) {
         return RespValue::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'xadd' command",
         ));
     }
 
     let fields: Vec<(Bytes, Bytes)> = fields_and_values
-        .chunks_exact(2)
-        .map(|chunk| (chunk[0].clone(), chunk[1].clone()))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[field, value]| (field.clone(), value.clone()))
         .collect();
 
     let mut entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
@@ -163,7 +165,7 @@ async fn handle_xread(
     }
 
     let num_keys = args.len() / 2;
-    if num_keys == 0 || args.len() % 2 != 0 {
+    if num_keys == 0 || !args.len().is_multiple_of(2) {
         return RespValue::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'xread' command",
         ));
@@ -273,4 +275,90 @@ fn format_xread_response(results: XReadResult) -> RespValue {
         })
         .collect();
     RespValue::Array(result_array)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bulk(s: &str) -> RespValue {
+        RespValue::BulkString(Bytes::copy_from_slice(s.as_bytes()))
+    }
+
+    fn command(parts: &[&str]) -> ParsedCommand {
+        ParsedCommand::from_resp(RespValue::Array(parts.iter().map(|p| bulk(p)).collect()))
+            .expect("valid command")
+    }
+
+    async fn run(parts: &[&str], store: &Arc<Store>) -> RespValue {
+        handle(command(parts), store, &Arc::new(WaiterRegistry::new())).await
+    }
+
+    #[tokio::test]
+    async fn xadd_stores_field_value_pairs_in_order() {
+        let store = Arc::new(Store::new());
+        assert_eq!(
+            run(&["XADD", "s", "1-1", "a", "1", "b", "2"], &store).await,
+            bulk("1-1")
+        );
+        assert_eq!(
+            run(&["XRANGE", "s", "-", "+"], &store).await,
+            RespValue::Array(vec![RespValue::Array(vec![
+                bulk("1-1"),
+                RespValue::Array(vec![bulk("a"), bulk("1"), bulk("b"), bulk("2")]),
+            ])])
+        );
+    }
+
+    #[tokio::test]
+    async fn xadd_rejects_odd_field_value_count() {
+        let store = Arc::new(Store::new());
+        assert_eq!(
+            run(&["XADD", "s", "1-1", "a", "1", "b"], &store).await,
+            RespValue::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'xadd' command"
+            ))
+        );
+        assert_eq!(
+            run(&["XRANGE", "s", "-", "+"], &store).await,
+            RespValue::Array(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn xread_rejects_keys_without_matching_ids() {
+        let store = Arc::new(Store::new());
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "s1", "s2", "0-0"], &store).await,
+            RespValue::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'xread' command"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn xread_reads_every_requested_stream() {
+        let store = Arc::new(Store::new());
+        run(&["XADD", "s1", "1-1", "a", "1"], &store).await;
+        run(&["XADD", "s2", "2-1", "b", "2"], &store).await;
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "s1", "s2", "0-0", "0-0"], &store).await,
+            RespValue::Array(vec![
+                RespValue::Array(vec![
+                    bulk("s1"),
+                    RespValue::Array(vec![RespValue::Array(vec![
+                        bulk("1-1"),
+                        RespValue::Array(vec![bulk("a"), bulk("1")]),
+                    ])]),
+                ]),
+                RespValue::Array(vec![
+                    bulk("s2"),
+                    RespValue::Array(vec![RespValue::Array(vec![
+                        bulk("2-1"),
+                        RespValue::Array(vec![bulk("b"), bulk("2")]),
+                    ])]),
+                ]),
+            ])
+        );
+    }
 }

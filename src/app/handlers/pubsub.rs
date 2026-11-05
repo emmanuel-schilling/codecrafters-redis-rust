@@ -80,6 +80,8 @@ pub fn unsubscribe(
     (response, removed_subs)
 }
 
+/// Serves a client in subscribed mode. Returns when the client disconnects
+/// or the connection fails; the caller then removes its subscriptions.
 pub async fn subscribed_loop(
     framed: &mut Framed<TcpStream, RespDecoder>,
     subscriptions: &mut HashSet<Bytes>,
@@ -87,13 +89,13 @@ pub async fn subscribed_loop(
     rx: &mut mpsc::Receiver<RespValue>,
     pubsub: &PubSubHub,
     client_id: u64,
-) -> Result<(), ()> {
+) {
     loop {
         tokio::select! {
             Some(message) = rx.recv() => {
                 if let Err(e) = framed.send(message).await {
                     error!("failed to send published message to client: {e}");
-                    return Err(());
+                    return;
                 }
             }
             result = framed.next() => {
@@ -112,7 +114,7 @@ pub async fn subscribed_loop(
 
                         if !allowed_in_sub_mode {
                              let err_msg = format!("ERR Can't execute '{cmd}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context");
-                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await { error!("failed to send subscribed mode error: {e}"); return Err(()); }
+                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await { error!("failed to send subscribed mode error: {e}"); return; }
                              continue;
                         }
 
@@ -135,13 +137,77 @@ pub async fn subscribed_loop(
 
                          if let Err(e) = framed.send(response).await {
                               error!("failed to send response in subscribed mode: {e}");
-                              return Err(());
+                              return;
                          }
                     }
-                    Some(Err(e)) => { error!("error reading from stream in subscribed mode: {e}"); return Err(()); }
-                    None => return Err(()),
+                    Some(Err(e)) => { error!("error reading from stream in subscribed mode: {e}"); return; }
+                    None => return,
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn connected_pair() -> (TcpStream, Framed<TcpStream, RespDecoder>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        (client, Framed::new(server, RespDecoder))
+    }
+
+    #[tokio::test]
+    async fn subscribed_loop_returns_when_client_disconnects() {
+        let (client, mut framed) = connected_pair().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut subscriptions = HashSet::new();
+        drop(client);
+
+        subscribed_loop(
+            &mut framed,
+            &mut subscriptions,
+            &tx,
+            &mut rx,
+            &PubSubHub::new(),
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn subscribed_loop_delivers_messages_until_disconnect() {
+        let (client, mut framed) = connected_pair().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut subscriptions = HashSet::new();
+        let message = RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"message")),
+            RespValue::BulkString(Bytes::from_static(b"ch")),
+            RespValue::BulkString(Bytes::from_static(b"hi")),
+        ]);
+        tx.send(message.clone()).await.expect("queue message");
+
+        let client_task = tokio::spawn(async move {
+            let mut client = Framed::new(client, RespDecoder);
+            let received = client.next().await.expect("frame").expect("decode");
+            drop(client);
+            received
+        });
+
+        subscribed_loop(
+            &mut framed,
+            &mut subscriptions,
+            &tx,
+            &mut rx,
+            &PubSubHub::new(),
+            1,
+        )
+        .await;
+        assert_eq!(client_task.await.expect("client task"), message);
     }
 }
