@@ -45,6 +45,9 @@ pub enum Command {
     GeoPos,
     GeoDist,
     GeoSearch,
+    // Bitmap Commands
+    SetBit,
+    GetBit,
 }
 
 impl Command {
@@ -68,6 +71,7 @@ impl Command {
                 | Command::ZAdd
                 | Command::ZRem
                 | Command::GeoAdd
+                | Command::SetBit
         )
     }
 }

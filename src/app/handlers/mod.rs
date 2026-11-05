@@ -4,6 +4,7 @@ use crate::app::{
     AppContext, RespValue,
 };
 
+pub mod bitmap;
 pub mod connection;
 pub mod geo;
 pub mod list;
@@ -59,6 +60,9 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
         Command::GeoPos => geo::geopos(&parsed, store),
         Command::GeoDist => geo::geodist(&parsed, store),
         Command::GeoSearch => geo::geosearch(&parsed, store),
+
+        Command::SetBit => bitmap::setbit(&parsed, store),
+        Command::GetBit => bitmap::getbit(&parsed, store),
 
         Command::Publish => pubsub::publish(&parsed, &ctx.pubsub),
 
