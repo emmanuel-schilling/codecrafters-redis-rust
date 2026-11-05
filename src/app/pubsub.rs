@@ -3,16 +3,37 @@ use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 type ClientId = u64;
-type SubscriberMap = HashMap<ClientId, mpsc::Sender<RespValue>>;
+
+/// Most messages queued for one subscriber. A subscriber that falls further
+/// behind is disconnected rather than silently missing messages, as Redis
+/// disconnects clients that exceed its pub/sub output buffer limit.
+pub const SUBSCRIBER_QUEUE_LEN: usize = 1024;
+
+#[derive(Debug, Default)]
+struct Subscriptions {
+    /// The only sender for each subscribed client's queue. Dropping it ends the
+    /// client's subscribed mode once its queued messages are delivered.
+    clients: HashMap<ClientId, mpsc::Sender<RespValue>>,
+    /// The clients subscribed to each channel.
+    channels: HashMap<Bytes, HashSet<ClientId>>,
+}
+
+impl Subscriptions {
+    fn remove_client(&mut self, client_id: ClientId) {
+        self.clients.remove(&client_id);
+        self.channels.retain(|_, subscribers| {
+            subscribers.remove(&client_id);
+            !subscribers.is_empty()
+        });
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct PubSubHub {
-    /// Maps a channel name to a map of subscribers.
-    /// The inner map maps a unique client ID to their sender channel.
-    channels: Mutex<HashMap<Bytes, SubscriberMap>>,
+    inner: Mutex<Subscriptions>,
 }
 
 impl PubSubHub {
@@ -20,42 +41,49 @@ impl PubSubHub {
         Self::default()
     }
 
-    /// Locks the channel map, recovering it if another task panicked while holding it.
-    fn channels(&self) -> MutexGuard<'_, HashMap<Bytes, SubscriberMap>> {
-        self.channels.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Locks the subscriptions, recovering them if another task panicked while holding them.
+    fn inner(&self) -> MutexGuard<'_, Subscriptions> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Subscribes a client to a channel.
-    pub fn subscribe(&self, channel: Bytes, client_id: ClientId, sender: mpsc::Sender<RespValue>) {
-        self.channels()
+    /// Starts a client's message queue and returns its receiving end. The
+    /// queue closes when the client is removed.
+    pub fn register(&self, client_id: ClientId) -> mpsc::Receiver<RespValue> {
+        let (sender, receiver) = mpsc::channel(SUBSCRIBER_QUEUE_LEN);
+        self.inner().clients.insert(client_id, sender);
+        receiver
+    }
+
+    /// Subscribes a registered client to a channel.
+    pub fn subscribe(&self, channel: Bytes, client_id: ClientId) {
+        self.inner()
+            .channels
             .entry(channel)
             .or_default()
-            .insert(client_id, sender);
+            .insert(client_id);
     }
 
     /// Unsubscribes a client from a specific channel.
     pub fn unsubscribe(&self, channel: &Bytes, client_id: ClientId) {
-        let mut channels = self.channels();
-        if let Some(channel_subs) = channels.get_mut(channel) {
-            channel_subs.remove(&client_id);
-            if channel_subs.is_empty() {
-                // Clean up the channel entry if no subscribers are left.
-                channels.remove(channel);
+        let mut inner = self.inner();
+        if let Some(subscribers) = inner.channels.get_mut(channel) {
+            subscribers.remove(&client_id);
+            if subscribers.is_empty() {
+                inner.channels.remove(channel);
             }
         }
     }
 
-    /// Unsubscribes a client from all channels they are part of.
-    pub fn unsubscribe_all(&self, client_id: ClientId, subscriptions: &HashSet<Bytes>) {
-        for channel in subscriptions {
-            self.unsubscribe(channel, client_id);
-        }
+    /// Removes a client from every channel and closes its queue.
+    pub fn remove_client(&self, client_id: ClientId) {
+        self.inner().remove_client(client_id);
     }
 
-    /// Publishes a message to all subscribers of a channel.
-    /// Returns the number of clients that received the message.
+    /// Publishes a message to all subscribers of a channel and returns how many
+    /// received it. A subscriber whose queue is full is disconnected.
     pub fn publish(&self, channel: Bytes, message: Bytes) -> usize {
-        let channels = self.channels();
+        let mut inner = self.inner();
+        let Subscriptions { clients, channels } = &mut *inner;
         let Some(subscribers) = channels.get(&channel) else {
             return 0;
         };
@@ -66,18 +94,91 @@ impl PubSubHub {
             RespValue::BulkString(message),
         ]);
 
-        let mut recipient_count = 0;
-
-        // We iterate over subscribers, cloning their senders. If a send fails,
-        // it means the client has disconnected, but we don't handle cleanup here
-        // for simplicity. The client's main task handles full cleanup on disconnect.
-        for sender in subscribers.values() {
-            if sender.try_send(message_payload.clone()).is_ok() {
-                recipient_count += 1;
+        let mut delivered = 0;
+        let mut too_slow = Vec::new();
+        for client_id in subscribers {
+            let sent = clients
+                .get(client_id)
+                .map(|sender| sender.try_send(message_payload.clone()));
+            match sent {
+                Some(Ok(())) => delivered += 1,
+                // A full queue means the client fell too far behind; a closed
+                // one means it has gone. Either way it stops receiving.
+                _ => too_slow.push(*client_id),
             }
         }
+        for client_id in too_slow {
+            warn!("disconnecting subscriber {client_id}: its message queue is full or closed");
+            inner.remove_client(client_id);
+        }
 
-        debug!("Published message to {recipient_count} subscribers.");
-        recipient_count
+        debug!("Published message to {delivered} subscribers.");
+        delivered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(name: &'static str) -> Bytes {
+        Bytes::from_static(name.as_bytes())
+    }
+
+    #[test]
+    fn publishes_to_every_subscriber_of_the_channel() {
+        let hub = PubSubHub::new();
+        let mut first = hub.register(1);
+        let mut second = hub.register(2);
+        hub.subscribe(channel("a"), 1);
+        hub.subscribe(channel("a"), 2);
+        hub.subscribe(channel("b"), 2);
+
+        assert_eq!(hub.publish(channel("a"), channel("hi")), 2);
+        assert_eq!(hub.publish(channel("c"), channel("hi")), 0);
+        assert!(first.try_recv().is_ok());
+        assert!(second.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_subscriber_whose_queue_is_full_is_disconnected() {
+        let hub = PubSubHub::new();
+        let mut slow = hub.register(1);
+        let mut fast = hub.register(2);
+        hub.subscribe(channel("a"), 1);
+        hub.subscribe(channel("a"), 2);
+
+        for _ in 0..SUBSCRIBER_QUEUE_LEN {
+            assert_eq!(hub.publish(channel("a"), channel("m")), 2);
+            assert!(fast.try_recv().is_ok());
+        }
+        // The slow client's queue is full: it misses this message and is removed.
+        assert_eq!(hub.publish(channel("a"), channel("m")), 1);
+        assert_eq!(hub.publish(channel("a"), channel("m")), 1);
+
+        // It still gets what was queued, then its queue reports closed.
+        for _ in 0..SUBSCRIBER_QUEUE_LEN {
+            assert!(slow.try_recv().is_ok());
+        }
+        assert_eq!(
+            slow.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn removing_a_client_unsubscribes_it_everywhere() {
+        let hub = PubSubHub::new();
+        let mut receiver = hub.register(1);
+        hub.subscribe(channel("a"), 1);
+        hub.subscribe(channel("b"), 1);
+        hub.remove_client(1);
+
+        assert_eq!(hub.publish(channel("a"), channel("m")), 0);
+        assert!(hub.inner().channels.is_empty());
+        assert_eq!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        );
     }
 }

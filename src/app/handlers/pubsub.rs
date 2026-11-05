@@ -1,6 +1,7 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     error::AppError,
+    handlers::Reply,
     protocol::{RespDecoder, RespValue},
     pubsub::PubSubHub,
 };
@@ -21,24 +22,20 @@ pub enum SubscribedExit {
     Disconnected,
 }
 
-pub fn publish(parsed: ParsedCommand, pubsub: &PubSubHub) -> RespValue {
-    let (Some(channel), Some(message)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'publish' command",
-        ));
-    };
-
+pub fn publish(parsed: &ParsedCommand, pubsub: &PubSubHub) -> Reply {
+    let channel = parsed.required(0)?;
+    let message = parsed.required(1)?;
     let subscriber_count = pubsub.publish(channel.clone(), message.clone());
-    RespValue::Integer(subscriber_count as i64)
+    Ok(RespValue::Integer(subscriber_count as i64))
 }
 
-/// Subscribes to each named channel. Returns one reply per channel, as Redis
-/// sends, each with the number of channels subscribed so far.
+/// Subscribes a client, already registered with the hub, to each named
+/// channel. Returns one reply per channel, as Redis sends, each with the
+/// number of channels subscribed so far.
 pub fn subscribe(
     parsed: &ParsedCommand,
     pubsub: &PubSubHub,
     client_id: u64,
-    sender: &mpsc::Sender<RespValue>,
     subscriptions: &mut HashSet<Bytes>,
 ) -> Vec<RespValue> {
     let channels = parsed.args_from(0);
@@ -51,7 +48,7 @@ pub fn subscribe(
         .iter()
         .map(|channel| {
             if subscriptions.insert(channel.clone()) {
-                pubsub.subscribe(channel.clone(), client_id, sender.clone());
+                pubsub.subscribe(channel.clone(), client_id);
             }
             subscription_reply(
                 b"subscribe",
@@ -121,18 +118,21 @@ pub async fn send_all(
 }
 
 /// Serves a client in subscribed mode until it unsubscribes from its last
-/// channel or disconnects.
+/// channel, disconnects, or is dropped by the hub for falling behind.
 pub async fn subscribed_loop(
     framed: &mut Framed<TcpStream, RespDecoder>,
     subscriptions: &mut HashSet<Bytes>,
-    tx: &mpsc::Sender<RespValue>,
     rx: &mut mpsc::Receiver<RespValue>,
     pubsub: &PubSubHub,
     client_id: u64,
 ) -> SubscribedExit {
     loop {
         tokio::select! {
-            Some(message) = rx.recv() => {
+            message = rx.recv() => {
+                // The hub closed the queue: the client fell too far behind.
+                let Some(message) = message else {
+                    return SubscribedExit::Disconnected;
+                };
                 if let Err(e) = framed.send(message).await {
                     error!("failed to send published message to client: {e}");
                     return SubscribedExit::Disconnected;
@@ -159,7 +159,7 @@ pub async fn subscribed_loop(
 
                 let replies = match parsed_command.command() {
                     Command::Subscribe => {
-                        subscribe(&parsed_command, pubsub, client_id, tx, subscriptions)
+                        subscribe(&parsed_command, pubsub, client_id, subscriptions)
                     }
                     Command::Unsubscribe => {
                         unsubscribe(&parsed_command, pubsub, client_id, subscriptions)
@@ -201,20 +201,13 @@ mod tests {
     #[tokio::test]
     async fn subscribed_loop_returns_when_client_disconnects() {
         let (client, mut framed) = connected_pair().await;
-        let (tx, mut rx) = mpsc::channel(1);
+        let hub = PubSubHub::new();
+        let mut rx = hub.register(1);
         let mut subscriptions = HashSet::new();
         drop(client);
 
         assert_eq!(
-            subscribed_loop(
-                &mut framed,
-                &mut subscriptions,
-                &tx,
-                &mut rx,
-                &PubSubHub::new(),
-                1,
-            )
-            .await,
+            subscribed_loop(&mut framed, &mut subscriptions, &mut rx, &hub, 1).await,
             SubscribedExit::Disconnected
         );
     }
@@ -222,14 +215,19 @@ mod tests {
     #[tokio::test]
     async fn subscribed_loop_delivers_messages_until_disconnect() {
         let (client, mut framed) = connected_pair().await;
-        let (tx, mut rx) = mpsc::channel(1);
+        let hub = PubSubHub::new();
+        let mut rx = hub.register(1);
         let mut subscriptions = HashSet::new();
+        hub.subscribe(Bytes::from_static(b"ch"), 1);
         let message = RespValue::Array(vec![
             RespValue::BulkString(Bytes::from_static(b"message")),
             RespValue::BulkString(Bytes::from_static(b"ch")),
             RespValue::BulkString(Bytes::from_static(b"hi")),
         ]);
-        tx.send(message.clone()).await.expect("queue message");
+        assert_eq!(
+            hub.publish(Bytes::from_static(b"ch"), Bytes::from_static(b"hi")),
+            1
+        );
 
         let client_task = tokio::spawn(async move {
             let mut client = Framed::new(client, RespDecoder);
@@ -239,15 +237,7 @@ mod tests {
         });
 
         assert_eq!(
-            subscribed_loop(
-                &mut framed,
-                &mut subscriptions,
-                &tx,
-                &mut rx,
-                &PubSubHub::new(),
-                1,
-            )
-            .await,
+            subscribed_loop(&mut framed, &mut subscriptions, &mut rx, &hub, 1).await,
             SubscribedExit::Disconnected
         );
         assert_eq!(client_task.await.expect("client task"), message);
@@ -276,16 +266,10 @@ mod tests {
     #[test]
     fn replies_once_per_channel_with_running_counts() {
         let hub = PubSubHub::new();
-        let (tx, _rx) = mpsc::channel(1);
+        let _rx = hub.register(1);
         let mut subs = HashSet::new();
         assert_eq!(
-            subscribe(
-                &command(&["SUBSCRIBE", "a", "b", "a"]),
-                &hub,
-                1,
-                &tx,
-                &mut subs
-            ),
+            subscribe(&command(&["SUBSCRIBE", "a", "b", "a"]), &hub, 1, &mut subs),
             vec![
                 reply("subscribe", Some("a"), 1),
                 reply("subscribe", Some("b"), 2),
@@ -308,7 +292,7 @@ mod tests {
             vec![reply("unsubscribe", None, 0)]
         );
         assert!(matches!(
-            subscribe(&command(&["SUBSCRIBE"]), &hub, 1, &tx, &mut subs)[..],
+            subscribe(&command(&["SUBSCRIBE"]), &hub, 1, &mut subs)[..],
             [RespValue::Error(_)]
         ));
     }
@@ -317,13 +301,12 @@ mod tests {
     async fn unsubscribing_from_the_last_channel_leaves_subscribed_mode() {
         let (client, mut framed) = connected_pair().await;
         let hub = PubSubHub::new();
-        let (tx, mut rx) = mpsc::channel(1);
+        let mut rx = hub.register(1);
         let mut subscriptions = HashSet::new();
         subscribe(
             &command(&["SUBSCRIBE", "a", "b"]),
             &hub,
             1,
-            &tx,
             &mut subscriptions,
         );
 
@@ -339,7 +322,7 @@ mod tests {
         });
 
         assert_eq!(
-            subscribed_loop(&mut framed, &mut subscriptions, &tx, &mut rx, &hub, 1).await,
+            subscribed_loop(&mut framed, &mut subscriptions, &mut rx, &hub, 1).await,
             SubscribedExit::Unsubscribed
         );
         let (first, second, _client) = client_task.await.expect("client task");
@@ -352,6 +335,21 @@ mod tests {
         assert_eq!(
             hub.publish(Bytes::from_static(b"a"), Bytes::from_static(b"m")),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_dropped_by_the_hub_leaves_subscribed_mode() {
+        let (_client, mut framed) = connected_pair().await;
+        let hub = PubSubHub::new();
+        let mut rx = hub.register(1);
+        let mut subscriptions = HashSet::new();
+        subscribe(&command(&["SUBSCRIBE", "a"]), &hub, 1, &mut subscriptions);
+        hub.remove_client(1);
+
+        assert_eq!(
+            subscribed_loop(&mut framed, &mut subscriptions, &mut rx, &hub, 1).await,
+            SubscribedExit::Disconnected
         );
     }
 }

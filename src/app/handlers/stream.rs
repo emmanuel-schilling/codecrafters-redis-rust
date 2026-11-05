@@ -1,53 +1,28 @@
-use crate::app::command::Command;
 use crate::app::{
-    command::ParsedCommand,
+    command::{Command, ParsedCommand},
     error::AppError,
+    handlers::Reply,
     protocol::RespValue,
     store::{DataType, Store},
     stream::{Stream, StreamEntry, XReadResult},
     wait::WaiterRegistry,
 };
 use bytes::Bytes;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{self, Instant};
 
-pub async fn handle(
-    parsed: ParsedCommand,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-) -> RespValue {
-    match parsed.command() {
-        Command::XAdd => handle_xadd(parsed, store, waiters),
-        Command::XRange => handle_xrange(parsed, store),
-        Command::XRead => handle_xread(parsed, store, waiters).await,
-        _ => RespValue::Error(Bytes::from_static(b"ERR unknown stream command")),
-    }
+/// Argument `index` as UTF-8 text, or `invalid` as the error.
+fn text<'a>(parsed: &'a ParsedCommand, index: usize, invalid: &str) -> Result<&'a str, AppError> {
+    std::str::from_utf8(parsed.required(index)?).map_err(|_| AppError::ValueError(invalid.into()))
 }
 
-fn handle_xadd(
-    parsed: ParsedCommand,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-) -> RespValue {
-    let (Some(key), Some(id_spec_bytes)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'xadd' command",
-        ));
-    };
-    let Ok(id_spec) = std::str::from_utf8(id_spec_bytes) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR invalid stream ID specified in XADD",
-        ));
-    };
-
+pub fn xadd(parsed: &ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> Reply {
+    let key = parsed.required(0)?;
+    let id_spec = text(parsed, 1, "invalid stream ID specified in XADD")?;
     let fields_and_values = parsed.args_from(2);
     if fields_and_values.is_empty() || !fields_and_values.len().is_multiple_of(2) {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'xadd' command",
-        ));
+        return Err(AppError::WrongArity(Command::XAdd));
     }
-
     let fields: Vec<(Bytes, Bytes)> = fields_and_values
         .as_chunks::<2>()
         .0
@@ -55,7 +30,7 @@ fn handle_xadd(
         .map(|[field, value]| (field.clone(), value.clone()))
         .collect();
 
-    let added = store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream)? {
+    let id = store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream)? {
         Some(stream) => stream.add(id_spec, fields),
         // Create the stream only once the entry is accepted, so a rejected ID leaves no key.
         None => {
@@ -64,50 +39,24 @@ fn handle_xadd(
             ks.set(key.clone(), DataType::Stream(stream), None);
             Ok(id)
         }
-    });
-    match added {
-        Ok(id) => {
-            waiters.stream_changed(key);
-            RespValue::BulkString(Bytes::from(id.to_string()))
-        }
-        Err(e) => e.into(),
-    }
+    })?;
+    waiters.stream_changed(key);
+    Ok(RespValue::BulkString(Bytes::from(id.to_string())))
 }
 
-fn handle_xrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
-    let (Some(key), Some(start_bytes), Some(end_bytes)) =
-        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
-    else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'xrange' command",
-        ));
-    };
-    let Ok(start_spec) = std::str::from_utf8(start_bytes) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR invalid start ID for 'xrange' command",
-        ));
-    };
-    let Ok(end_spec) = std::str::from_utf8(end_bytes) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR invalid end ID for 'xrange' command",
-        ));
-    };
+pub fn xrange(parsed: &ParsedCommand, store: &Store) -> Reply {
+    let key = parsed.required(0)?;
+    parsed.required(2)?;
+    let start_spec = text(parsed, 1, "invalid start ID for 'xrange' command")?;
+    let end_spec = text(parsed, 2, "invalid end ID for 'xrange' command")?;
 
-    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream) {
-        Ok(Some(stream)) => match stream.range(start_spec, end_spec) {
-            Ok(entries) => format_entries(entries),
-            Err(e) => e.into(),
-        },
-        Ok(None) => RespValue::Array(vec![]),
-        Err(e) => e.into(),
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream)? {
+        Some(stream) => Ok(format_entries(stream.range(start_spec, end_spec)?)),
+        None => Ok(RespValue::Array(vec![])),
     })
 }
 
-async fn handle_xread(
-    parsed: ParsedCommand,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-) -> RespValue {
+pub async fn xread(parsed: &ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> Reply {
     let mut args = parsed.args_from(0);
     let mut blocking = false;
     let mut block_timeout = None;
@@ -117,25 +66,11 @@ async fn handle_xread(
         .is_some_and(|a| a.eq_ignore_ascii_case(b"block"))
     {
         if args.len() < 3 {
-            return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
+            return Err(AppError::Syntax);
         }
-        let Ok(timeout_ms_str) = std::str::from_utf8(&args[1]) else {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR invalid timeout in 'xread' command",
-            ));
-        };
-        let Ok(timeout_ms) = timeout_ms_str.parse::<u64>() else {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ));
-        };
-
+        let timeout_ms: u64 = parsed.integer(1)?;
         blocking = true;
-        block_timeout = if timeout_ms == 0 {
-            None
-        } else {
-            Some(Duration::from_millis(timeout_ms))
-        };
+        block_timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
         args = &args[2..];
     }
 
@@ -145,14 +80,12 @@ async fn handle_xread(
     {
         args = &args[1..];
     } else {
-        return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
+        return Err(AppError::Syntax);
     }
 
     let num_keys = args.len() / 2;
     if num_keys == 0 || !args.len().is_multiple_of(2) {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'xread' command",
-        ));
+        return Err(AppError::WrongArity(Command::XRead));
     }
 
     let keys = &args[..num_keys];
@@ -199,14 +132,11 @@ async fn handle_xread(
     // and the wait still wakes this client.
     let watch = blocking.then(|| waiters.watch_streams(keys));
 
-    match read() {
-        Ok(Some(results)) => return format_xread_response(results),
-        Ok(None) => {}
-        Err(e) => return e.into(),
+    if let Some(results) = read()? {
+        return Ok(format_xread_response(results));
     }
-
     let Some(watch) = watch else {
-        return RespValue::NullArray;
+        return Ok(RespValue::NullArray);
     };
     // No deadline for BLOCK 0, or for one too far ahead to represent.
     let deadline = block_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
@@ -217,15 +147,13 @@ async fn handle_xread(
                     .await
                     .is_err()
                 {
-                    return RespValue::NullArray;
+                    return Ok(RespValue::NullArray);
                 }
             }
             None => watch.changed.notified().await,
         }
-        match read() {
-            Ok(Some(results)) => return format_xread_response(results),
-            Ok(None) => {}
-            Err(e) => return e.into(),
+        if let Some(results) = read()? {
+            return Ok(format_xread_response(results));
         }
     }
 }
@@ -265,29 +193,26 @@ fn format_xread_response(results: XReadResult) -> RespValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::AppContext;
+    use std::sync::Arc;
 
     fn bulk(s: &str) -> RespValue {
         RespValue::BulkString(Bytes::copy_from_slice(s.as_bytes()))
     }
 
-    fn command(parts: &[&str]) -> ParsedCommand {
-        ParsedCommand::from_resp(RespValue::Array(parts.iter().map(|p| bulk(p)).collect()))
-            .expect("valid command")
-    }
-
-    async fn run(parts: &[&str], store: &Arc<Store>) -> RespValue {
-        handle(command(parts), store, &Arc::new(WaiterRegistry::new())).await
+    async fn run(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
+        crate::app::run_test(parts, ctx).await
     }
 
     #[tokio::test]
     async fn xadd_stores_field_value_pairs_in_order() {
-        let store = Arc::new(Store::new());
+        let ctx = crate::app::test_context();
         assert_eq!(
-            run(&["XADD", "s", "1-1", "a", "1", "b", "2"], &store).await,
+            run(&["XADD", "s", "1-1", "a", "1", "b", "2"], &ctx).await,
             bulk("1-1")
         );
         assert_eq!(
-            run(&["XRANGE", "s", "-", "+"], &store).await,
+            run(&["XRANGE", "s", "-", "+"], &ctx).await,
             RespValue::Array(vec![RespValue::Array(vec![
                 bulk("1-1"),
                 RespValue::Array(vec![bulk("a"), bulk("1"), bulk("b"), bulk("2")]),
@@ -297,24 +222,24 @@ mod tests {
 
     #[tokio::test]
     async fn xadd_rejects_odd_field_value_count() {
-        let store = Arc::new(Store::new());
+        let ctx = crate::app::test_context();
         assert_eq!(
-            run(&["XADD", "s", "1-1", "a", "1", "b"], &store).await,
+            run(&["XADD", "s", "1-1", "a", "1", "b"], &ctx).await,
             RespValue::Error(Bytes::from_static(
                 b"ERR wrong number of arguments for 'xadd' command"
             ))
         );
         assert_eq!(
-            run(&["XRANGE", "s", "-", "+"], &store).await,
+            run(&["XRANGE", "s", "-", "+"], &ctx).await,
             RespValue::Array(vec![])
         );
     }
 
     #[tokio::test]
     async fn xread_rejects_keys_without_matching_ids() {
-        let store = Arc::new(Store::new());
+        let ctx = crate::app::test_context();
         assert_eq!(
-            run(&["XREAD", "STREAMS", "s1", "s2", "0-0"], &store).await,
+            run(&["XREAD", "STREAMS", "s1", "s2", "0-0"], &ctx).await,
             RespValue::Error(Bytes::from_static(
                 b"ERR wrong number of arguments for 'xread' command"
             ))
@@ -323,11 +248,11 @@ mod tests {
 
     #[tokio::test]
     async fn xread_reads_every_requested_stream() {
-        let store = Arc::new(Store::new());
-        run(&["XADD", "s1", "1-1", "a", "1"], &store).await;
-        run(&["XADD", "s2", "2-1", "b", "2"], &store).await;
+        let ctx = crate::app::test_context();
+        run(&["XADD", "s1", "1-1", "a", "1"], &ctx).await;
+        run(&["XADD", "s2", "2-1", "b", "2"], &ctx).await;
         assert_eq!(
-            run(&["XREAD", "STREAMS", "s1", "s2", "0-0", "0-0"], &store).await,
+            run(&["XREAD", "STREAMS", "s1", "s2", "0-0", "0-0"], &ctx).await,
             RespValue::Array(vec![
                 RespValue::Array(vec![
                     bulk("s1"),
@@ -349,21 +274,14 @@ mod tests {
 
     #[tokio::test]
     async fn xadd_wakes_every_blocked_reader() {
-        let store = Arc::new(Store::new());
-        let waiters = Arc::new(WaiterRegistry::new());
-        let read = || {
-            handle(
-                command(&["XREAD", "BLOCK", "0", "STREAMS", "s", "$"]),
-                &store,
-                &waiters,
-            )
-        };
-        let mut first = Box::pin(read());
-        let mut second = Box::pin(read());
+        let ctx = crate::app::test_context();
+        let read = ["XREAD", "BLOCK", "0", "STREAMS", "s", "$"];
+        let mut first = Box::pin(run(&read, &ctx));
+        let mut second = Box::pin(run(&read, &ctx));
         assert!(futures::poll!(&mut first).is_pending());
         assert!(futures::poll!(&mut second).is_pending());
 
-        handle(command(&["XADD", "s", "1-1", "a", "1"]), &store, &waiters).await;
+        run(&["XADD", "s", "1-1", "a", "1"], &ctx).await;
         let expected = RespValue::Array(vec![RespValue::Array(vec![
             bulk("s"),
             RespValue::Array(vec![RespValue::Array(vec![
@@ -377,23 +295,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_xadd_creates_no_key() {
-        let store = Arc::new(Store::new());
+        let ctx = crate::app::test_context();
         assert!(matches!(
-            run(&["XADD", "s", "0-0", "a", "1"], &store).await,
+            run(&["XADD", "s", "0-0", "a", "1"], &ctx).await,
             RespValue::Error(_)
         ));
         assert_eq!(
-            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"s"))),
+            ctx.store
+                .with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"s"))),
             "none"
         );
     }
 
     #[tokio::test]
     async fn xread_without_block_replies_null_array_when_empty() {
-        let store = Arc::new(Store::new());
-        run(&["XADD", "s", "1-1", "a", "1"], &store).await;
+        let ctx = crate::app::test_context();
+        run(&["XADD", "s", "1-1", "a", "1"], &ctx).await;
         assert_eq!(
-            run(&["XREAD", "STREAMS", "s", "1-1"], &store).await,
+            run(&["XREAD", "STREAMS", "s", "1-1"], &ctx).await,
             RespValue::NullArray
         );
     }

@@ -1,9 +1,8 @@
 use crate::app::{
-    command::{CommandHandler, ParsedCommand},
+    command::{Command, ParsedCommand},
+    error::AppError,
     AppContext, RespValue,
 };
-use async_trait::async_trait;
-use std::sync::Arc;
 
 pub mod connection;
 pub mod geo;
@@ -16,74 +15,62 @@ pub mod stream;
 pub mod string;
 pub mod transaction;
 
-pub struct ConnectionHandler;
-#[async_trait]
-impl CommandHandler for ConnectionHandler {
-    async fn handle(&self, _ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        connection::handle(parsed)
-    }
-}
+/// A command's reply. An error becomes the error reply sent to the client.
+pub type Reply = Result<RespValue, AppError>;
 
-pub struct StringHandler;
-#[async_trait]
-impl CommandHandler for StringHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        string::handle(parsed, &ctx.store)
-    }
-}
+/// Runs a command and returns its reply.
+pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
+    let store = &ctx.store;
+    let reply = match parsed.command() {
+        Command::Ping => connection::ping(),
+        Command::Echo => connection::echo(&parsed),
 
-pub struct ServerHandler;
-#[async_trait]
-impl CommandHandler for ServerHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        server::handle(parsed, &ctx.config, &ctx.store)
-    }
-}
+        Command::Set => string::set(&parsed, store),
+        Command::Get => string::get(&parsed, store),
+        Command::Incr => string::incr(&parsed, store),
 
-pub struct ReplicationHandler;
-#[async_trait]
-impl CommandHandler for ReplicationHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        replication::handle(parsed, &ctx.replication).await
-    }
-}
+        Command::Config => server::config(&parsed, &ctx.config),
+        Command::Keys => server::keys(&parsed, store),
+        Command::Type => server::key_type(&parsed, store),
 
-pub struct ListHandler;
-#[async_trait]
-impl CommandHandler for ListHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        list::handle(parsed, ctx).await
-    }
-}
+        Command::Info => replication::info(&parsed, &ctx.replication),
+        Command::ReplConf => replication::replconf(),
+        Command::Wait => replication::wait(&parsed, &ctx.replication).await,
 
-pub struct StreamHandler;
-#[async_trait]
-impl CommandHandler for StreamHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        stream::handle(parsed, &ctx.store, &ctx.waiters).await
-    }
-}
+        Command::LPush => list::push(&parsed, store, list::End::Front),
+        Command::RPush => list::push(&parsed, store, list::End::Back),
+        Command::LPop => list::lpop(&parsed, store),
+        Command::LLen => list::llen(&parsed, store),
+        Command::LRange => list::lrange(&parsed, store),
+        Command::BLPop => list::blpop(&parsed, ctx).await,
 
-pub struct SortedSetHandler;
-#[async_trait]
-impl CommandHandler for SortedSetHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        sorted_set::handle(parsed, &ctx.store)
-    }
-}
+        Command::XAdd => stream::xadd(&parsed, store, &ctx.waiters),
+        Command::XRange => stream::xrange(&parsed, store),
+        Command::XRead => stream::xread(&parsed, store, &ctx.waiters).await,
 
-pub struct GeoHandler;
-#[async_trait]
-impl CommandHandler for GeoHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        geo::handle(parsed, &ctx.store)
-    }
-}
+        Command::ZAdd => sorted_set::zadd(&parsed, store),
+        Command::ZCard => sorted_set::zcard(&parsed, store),
+        Command::ZScore => sorted_set::zscore(&parsed, store),
+        Command::ZRank => sorted_set::zrank(&parsed, store),
+        Command::ZRange => sorted_set::zrange(&parsed, store),
+        Command::ZRem => sorted_set::zrem(&parsed, store),
 
-pub struct PubSubHandler;
-#[async_trait]
-impl CommandHandler for PubSubHandler {
-    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-        pubsub::publish(parsed, &ctx.pubsub)
-    }
+        Command::GeoAdd => geo::geoadd(&parsed, store),
+        Command::GeoPos => geo::geopos(&parsed, store),
+        Command::GeoDist => geo::geodist(&parsed, store),
+        Command::GeoSearch => geo::geosearch(&parsed, store),
+
+        Command::Publish => pubsub::publish(&parsed, &ctx.pubsub),
+
+        // The connection loop handles these, and the transaction state handles
+        // MULTI, EXEC and DISCARD, before a command is dispatched; anywhere
+        // else (queued in a transaction, or sent by a master) they're unknown.
+        Command::PSync
+        | Command::Subscribe
+        | Command::Unsubscribe
+        | Command::Multi
+        | Command::Exec
+        | Command::Discard => Err(AppError::UnknownCommand(parsed.command().to_string())),
+    };
+    reply.unwrap_or_else(RespValue::from)
 }

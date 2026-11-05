@@ -8,3 +8,7 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Markdown notes and plans stay local and aren't submitted; the README is tracked
+*.md
+!README.md

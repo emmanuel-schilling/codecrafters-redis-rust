@@ -1,5 +1,5 @@
 use crate::app::{
-    command::{Command, CommandHandler, ParsedCommand},
+    command::{Command, ParsedCommand},
     protocol::{RespDecoder, RespValue},
     pubsub::PubSubHub,
     replication::ReplicationState,
@@ -9,7 +9,7 @@ use crate::app::{
 use crate::config::Config;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -33,15 +33,12 @@ pub mod wait;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
-pub type CommandRegistry = HashMap<Command, Arc<dyn CommandHandler>>;
-
 pub struct AppContext {
     pub store: Arc<Store>,
     pub config: Arc<Config>,
     pub replication: Arc<ReplicationState>,
     pub pubsub: Arc<PubSubHub>,
     pub waiters: Arc<WaiterRegistry>,
-    pub registry: CommandRegistry,
     /// Held while a write runs and is sent to replicas, so replicas receive
     /// writes in the order this server applied them.
     pub write_order: tokio::sync::Mutex<()>,
@@ -55,64 +52,12 @@ impl AppContext {
         pubsub: Arc<PubSubHub>,
         waiters: Arc<WaiterRegistry>,
     ) -> Self {
-        let mut registry: CommandRegistry = HashMap::new();
-
-        let connection_handler = Arc::new(handlers::ConnectionHandler);
-        registry.insert(Command::Ping, connection_handler.clone());
-        registry.insert(Command::Echo, connection_handler);
-
-        let string_handler = Arc::new(handlers::StringHandler);
-        registry.insert(Command::Set, string_handler.clone());
-        registry.insert(Command::Get, string_handler.clone());
-        registry.insert(Command::Incr, string_handler);
-
-        let server_handler = Arc::new(handlers::ServerHandler);
-        registry.insert(Command::Config, server_handler.clone());
-        registry.insert(Command::Keys, server_handler.clone());
-        registry.insert(Command::Type, server_handler);
-
-        let replication_handler = Arc::new(handlers::ReplicationHandler);
-        registry.insert(Command::Info, replication_handler.clone());
-        registry.insert(Command::ReplConf, replication_handler.clone());
-        registry.insert(Command::Wait, replication_handler);
-
-        let list_handler = Arc::new(handlers::ListHandler);
-        registry.insert(Command::LPush, list_handler.clone());
-        registry.insert(Command::RPush, list_handler.clone());
-        registry.insert(Command::LPop, list_handler.clone());
-        registry.insert(Command::LLen, list_handler.clone());
-        registry.insert(Command::LRange, list_handler.clone());
-        registry.insert(Command::BLPop, list_handler);
-
-        let stream_handler = Arc::new(handlers::StreamHandler);
-        registry.insert(Command::XAdd, stream_handler.clone());
-        registry.insert(Command::XRange, stream_handler.clone());
-        registry.insert(Command::XRead, stream_handler);
-
-        let sorted_set_handler = Arc::new(handlers::SortedSetHandler);
-        registry.insert(Command::ZAdd, sorted_set_handler.clone());
-        registry.insert(Command::ZCard, sorted_set_handler.clone());
-        registry.insert(Command::ZScore, sorted_set_handler.clone());
-        registry.insert(Command::ZRank, sorted_set_handler.clone());
-        registry.insert(Command::ZRange, sorted_set_handler.clone());
-        registry.insert(Command::ZRem, sorted_set_handler);
-
-        let geo_handler = Arc::new(handlers::GeoHandler);
-        registry.insert(Command::GeoAdd, geo_handler.clone());
-        registry.insert(Command::GeoPos, geo_handler.clone());
-        registry.insert(Command::GeoDist, geo_handler.clone());
-        registry.insert(Command::GeoSearch, geo_handler);
-
-        let pubsub_handler = Arc::new(handlers::PubSubHandler);
-        registry.insert(Command::Publish, pubsub_handler);
-
         Self {
             store,
             config,
             replication,
             pubsub,
             waiters,
-            registry,
             write_order: tokio::sync::Mutex::new(()),
         }
     }
@@ -124,7 +69,6 @@ pub enum ConnectionState {
     Subscribed {
         client_id: u64,
         subscriptions: HashSet<Bytes>,
-        tx: mpsc::Sender<RespValue>,
         rx: mpsc::Receiver<RespValue>,
     },
 }
@@ -139,22 +83,20 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
         if let ConnectionState::Subscribed {
             client_id,
             ref mut subscriptions,
-            ref tx,
             ref mut rx,
         } = state
         {
             let exit = handlers::pubsub::subscribed_loop(
                 &mut framed,
                 subscriptions,
-                tx,
                 rx,
                 &ctx.pubsub,
                 client_id,
             )
             .await;
+            ctx.pubsub.remove_client(client_id);
             if exit == handlers::pubsub::SubscribedExit::Disconnected {
                 info!("Client {client_id} disconnected from subscribed mode.");
-                ctx.pubsub.unsubscribe_all(client_id, subscriptions);
                 return;
             }
             state = ConnectionState::Normal;
@@ -174,25 +116,25 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                 };
 
                 if parsed_command.command() == Command::Subscribe {
-                    let (tx, rx) = mpsc::channel(128);
+                    let rx = ctx.pubsub.register(client_id);
                     let mut subscriptions = HashSet::new();
                     let replies = handlers::pubsub::subscribe(
                         &parsed_command,
                         &ctx.pubsub,
                         client_id,
-                        &tx,
                         &mut subscriptions,
                     );
                     if let Err(e) = handlers::pubsub::send_all(&mut framed, replies).await {
                         error!("failed to send subscribe response: {e}");
-                        ctx.pubsub.unsubscribe_all(client_id, &subscriptions);
+                        ctx.pubsub.remove_client(client_id);
                         return;
                     }
-                    if !subscriptions.is_empty() {
+                    if subscriptions.is_empty() {
+                        ctx.pubsub.remove_client(client_id);
+                    } else {
                         state = ConnectionState::Subscribed {
                             client_id,
                             subscriptions,
-                            tx,
                             rx,
                         };
                     }
@@ -261,10 +203,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
 
 /// Runs a command received from the master on a replica.
 pub async fn apply_command(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-    match ctx.registry.get(&parsed.command()) {
-        Some(handler) => handler.handle(ctx, parsed).await,
-        None => unknown_command(&parsed),
-    }
+    handlers::dispatch(ctx, parsed).await
 }
 
 pub async fn handle_command(
@@ -291,21 +230,17 @@ pub async fn handle_command(
         ));
     }
 
-    let Some(handler) = ctx.registry.get(&command) else {
-        return unknown_command(&parsed);
-    };
-
     // BLPOP may block, so it can't hold the write-order lock while it waits;
     // it takes the lock around each pop and propagates the pop itself.
     if !command.is_write() || command == Command::BLPop {
-        return handler.handle(ctx, parsed).await;
+        return handlers::dispatch(ctx, parsed).await;
     }
 
     let fed_list = matches!(command, Command::LPush | Command::RPush)
         .then(|| parsed.first().cloned())
         .flatten();
     let _order = ctx.write_order.lock().await;
-    let response = handler.handle(ctx, parsed.clone()).await;
+    let response = handlers::dispatch(ctx, parsed.clone()).await;
     if let Some(propagated) = propagated_form(parsed, &response) {
         ctx.replication.propagate(propagated);
         if let Some(key) = fed_list {
@@ -328,11 +263,28 @@ fn propagated_form(parsed: ParsedCommand, response: &RespValue) -> Option<RespVa
     }
 }
 
-fn unknown_command(parsed: &ParsedCommand) -> RespValue {
-    RespValue::Error(Bytes::from(format!(
-        "ERR unknown command '{}'",
-        parsed.command()
-    )))
+/// Builds a command from its parts, for unit tests.
+#[cfg(test)]
+pub(crate) fn test_command(parts: &[&str]) -> ParsedCommand {
+    ParsedCommand::from_resp(RespValue::Array(
+        parts
+            .iter()
+            .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect(),
+    ))
+    .expect("valid command")
+}
+
+/// Runs a command as a client connection would, for unit tests.
+#[cfg(test)]
+pub(crate) async fn run_test(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
+    handle_command(
+        test_command(parts),
+        ctx,
+        &mut ConnectionState::Normal,
+        &mut vec![],
+    )
+    .await
 }
 
 /// A master's context with default config, for unit tests.
@@ -352,26 +304,7 @@ pub(crate) fn test_context() -> Arc<AppContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn command(parts: &[&str]) -> ParsedCommand {
-        ParsedCommand::from_resp(RespValue::Array(
-            parts
-                .iter()
-                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
-                .collect(),
-        ))
-        .expect("valid command")
-    }
-
-    async fn run(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
-        handle_command(
-            command(parts),
-            ctx,
-            &mut ConnectionState::Normal,
-            &mut vec![],
-        )
-        .await
-    }
+    use super::{run_test as run, test_command as command};
 
     /// A master context with one connected replica, whose channel is returned.
     fn master_with_replica() -> (Arc<AppContext>, mpsc::UnboundedReceiver<RespValue>) {
@@ -488,6 +421,23 @@ mod tests {
         assert_eq!(
             run(&["TYPE", "q"], &ctx).await,
             RespValue::SimpleString(Bytes::from_static(b"none"))
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_handled_before_dispatch_are_unknown_when_queued() {
+        let ctx = test_context();
+        let mut state = ConnectionState::Normal;
+        let mut queue = vec![];
+        for parts in [&["MULTI"][..], &["SUBSCRIBE", "a"], &["PSYNC", "?", "-1"]] {
+            handle_command(command(parts), &ctx, &mut state, &mut queue).await;
+        }
+        assert_eq!(
+            handle_command(command(&["EXEC"]), &ctx, &mut state, &mut queue).await,
+            RespValue::Array(vec![
+                RespValue::Error(Bytes::from_static(b"ERR unknown command 'SUBSCRIBE'")),
+                RespValue::Error(Bytes::from_static(b"ERR unknown command 'PSYNC'")),
+            ])
         );
     }
 }

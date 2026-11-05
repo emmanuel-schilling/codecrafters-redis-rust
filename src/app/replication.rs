@@ -6,6 +6,8 @@ use crate::app::{
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, Bytes};
 use futures::{SinkExt, StreamExt};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex, MutexGuard, PoisonError,
@@ -58,7 +60,7 @@ impl ReplicationState {
 
         Self {
             role,
-            master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+            master_replid: generate_replid(),
             replicas: Mutex::new(Replicas::default()),
             acks_changed: Notify::new(),
         }
@@ -136,15 +138,15 @@ impl ReplicationState {
     }
 
     /// Waits until `wanted` replicas have acknowledged `target_offset`, or until
-    /// `timeout` passes, and returns how many have.
+    /// `timeout` passes (`None` waits indefinitely), and returns how many have.
     pub async fn wait_for_acks(
         &self,
         target_offset: usize,
         wanted: usize,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> usize {
-        let deadline = tokio::time::sleep(timeout);
-        tokio::pin!(deadline);
+        // No deadline either for no timeout or for one too far ahead to represent.
+        let deadline = timeout.and_then(|timeout| tokio::time::Instant::now().checked_add(timeout));
         loop {
             // Register for the next ACK before counting, so one that arrives
             // between the count and the wait still wakes this task.
@@ -156,9 +158,13 @@ impl ReplicationState {
             if count >= wanted {
                 return count;
             }
-            tokio::select! {
-                _ = &mut acked => {}
-                _ = &mut deadline => return self.count_acks(target_offset),
+            match deadline {
+                Some(deadline) => {
+                    if tokio::time::timeout_at(deadline, acked).await.is_err() {
+                        return self.count_acks(target_offset);
+                    }
+                }
+                None => acked.await,
             }
         }
     }
@@ -167,6 +173,17 @@ impl ReplicationState {
         acknowledged_offset.store(offset, Ordering::Release);
         self.acks_changed.notify_waiters();
     }
+}
+
+/// A new 40-character hexadecimal replication ID, as Redis generates at
+/// startup. It only has to differ between runs; it isn't a secret.
+fn generate_replid() -> String {
+    // Each `RandomState` is seeded randomly by the standard library.
+    let mut id: String = (0..3)
+        .map(|_| format!("{:016x}", RandomState::new().build_hasher().finish()))
+        .collect();
+    id.truncate(40);
+    id
 }
 
 pub async fn start_replica_mode(master_addr: String, listening_port: u16, ctx: Arc<AppContext>) {
@@ -397,7 +414,7 @@ mod tests {
         };
         // The timeout only bounds a failure; a correct wait returns on the ACK.
         let count = replication
-            .wait_for_acks(target, 1, Duration::from_secs(60))
+            .wait_for_acks(target, 1, Some(Duration::from_secs(60)))
             .await;
         acker.await.expect("acker");
         assert_eq!(count, 1);
@@ -411,7 +428,9 @@ mod tests {
         replication.propagate(set(b"a"));
         let target = replication.master_repl_offset();
         assert_eq!(
-            replication.wait_for_acks(target, 1, Duration::ZERO).await,
+            replication
+                .wait_for_acks(target, 1, Some(Duration::ZERO))
+                .await,
             0
         );
     }
@@ -471,5 +490,29 @@ mod tests {
                 .cloned()
         });
         assert_eq!(value, Some(Bytes::from_static(b"v")));
+    }
+
+    #[tokio::test]
+    async fn wait_for_acks_without_a_timeout_waits_for_the_ack() {
+        let replication = master();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let acked = replication.add_replica(tx);
+        replication.propagate(set(b"a"));
+        let target = replication.master_repl_offset();
+
+        let mut waiting = Box::pin(replication.wait_for_acks(target, 1, None));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        replication.record_ack(&acked, target);
+        assert_eq!(waiting.await, 1);
+    }
+
+    #[test]
+    fn replication_ids_are_40_hex_characters_and_differ() {
+        let (first, second) = (generate_replid(), generate_replid());
+        for id in [&first, &second] {
+            assert_eq!(id.len(), 40);
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(first, second);
     }
 }
