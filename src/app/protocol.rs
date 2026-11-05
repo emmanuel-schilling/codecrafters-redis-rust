@@ -31,8 +31,7 @@ impl RespValue {
         // If it does, it indicates an internal logic error.
         if let Err(e) = encoder.encode(self.clone(), &mut buffer) {
             // For safety, return a RESP error string. In a real-world scenario, this would be logged.
-            return Bytes::from(format!("-ERR Internal encoding error: {}
-", e));
+            return Bytes::from(format!("-ERR Internal encoding error: {}\r\n", e));
         }
 
         buffer.freeze()
@@ -71,7 +70,7 @@ impl Decoder for RespDecoder {
 
 /// Parses a full RESP message using `nom`.
 /// Returns a Result containing the remaining input and the parsed value, or a nom error.
-fn parse_message(input: &[u8]) -> Result<(&[u8], RespValue), nom::Err<nom::error::Error<&[u8]>>> {
+fn parse_message(input: &[u8]) -> IResult<&[u8], RespValue> {
     alt((
         parse_simple_string,
         parse_error,
@@ -85,8 +84,7 @@ fn parse_simple_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
         nom::sequence::preceded(
             tag("+"),
-            nom::sequence::terminated(take_until("
-"), crlf),
+            nom::sequence::terminated(take_until("\r\n"), crlf),
         ),
         |s: &[u8]| RespValue::SimpleString(Bytes::copy_from_slice(s)),
     )(input)
@@ -96,8 +94,7 @@ fn parse_error(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
         nom::sequence::preceded(
             tag("-"),
-            nom::sequence::terminated(take_until("
-"), crlf),
+            nom::sequence::terminated(take_until("\r\n"), crlf),
         ),
         |s: &[u8]| RespValue::Error(Bytes::copy_from_slice(s)),
     )(input)
@@ -131,7 +128,8 @@ fn parse_i64(input: &[u8]) -> Result<i64, nom::Err<nom::error::Error<&[u8]>>> {
         .map_err(|_| nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Char))) // Error if not valid UTF-8
         .and_then(|s| {
             s.parse::<i64>().map_err(|_| {
-                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Digit)) // Error if parsing to i64 fails
+                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
+                // Error if parsing to i64 fails
             })
         })
 }
@@ -139,8 +137,7 @@ fn parse_i64(input: &[u8]) -> Result<i64, nom::Err<nom::error::Error<&[u8]>>> {
 fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     let (input, len_str) = nom::sequence::preceded(
         tag("$"),
-        nom::sequence::terminated(take_until("
-"), crlf),
+        nom::sequence::terminated(take_until("\r\n"), crlf),
     )(input)?;
 
     // parse_i64 now returns Result, so we need to handle its potential error.
@@ -170,8 +167,7 @@ fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
 fn parse_array(input: &[u8]) -> IResult<&[u8], RespValue> {
     let (input, count_str) = nom::sequence::preceded(
         tag("*"),
-        nom::sequence::terminated(take_until("
-"), crlf),
+        nom::sequence::terminated(take_until("\r\n"), crlf),
     )(input)?;
 
     // parse_i64 now returns Result, so we need to handle its potential error.
@@ -205,49 +201,97 @@ impl Encoder<RespValue> for RespDecoder {
             RespValue::SimpleString(s) => {
                 dst.extend_from_slice(b"+");
                 dst.extend_from_slice(&s);
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
             }
             RespValue::Error(s) => {
                 dst.extend_from_slice(b"-");
                 dst.extend_from_slice(&s);
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
             }
             RespValue::Integer(i) => {
                 dst.extend_from_slice(b":");
                 dst.extend_from_slice(i.to_string().as_bytes());
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
             }
             RespValue::BulkString(s) => {
                 dst.extend_from_slice(b"$");
                 dst.extend_from_slice(s.len().to_string().as_bytes());
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
                 dst.extend_from_slice(&s);
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
             }
             RespValue::NullBulkString => {
-                dst.extend_from_slice(b"$-1
-");
+                dst.extend_from_slice(b"$-1\r\n");
             }
             RespValue::Array(items) => {
                 dst.extend_from_slice(b"*");
                 dst.extend_from_slice(items.len().to_string().as_bytes());
-                dst.extend_from_slice(b"
-");
+                dst.extend_from_slice(b"\r\n");
                 for item in items {
                     // The encode method itself can return an error, so we propagate it.
                     self.encode(item, dst)?;
                 }
             }
             RespValue::NullArray => {
-                dst.extend_from_slice(b"*-1
-");
+                dst.extend_from_slice(b"*-1\r\n");
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_all(bytes: &[u8]) -> Result<Option<RespValue>, AppError> {
+        RespDecoder.decode(&mut BytesMut::from(bytes))
+    }
+
+    #[test]
+    fn encodes_every_type_with_crlf_terminators() {
+        let value = RespValue::Array(vec![
+            RespValue::SimpleString(Bytes::from_static(b"OK")),
+            RespValue::Error(Bytes::from_static(b"ERR x")),
+            RespValue::Integer(-7),
+            RespValue::BulkString(Bytes::from_static(b"hi")),
+            RespValue::NullBulkString,
+            RespValue::NullArray,
+        ]);
+        assert_eq!(
+            &value.encode_to_bytes()[..],
+            b"*6\r\n+OK\r\n-ERR x\r\n:-7\r\n$2\r\nhi\r\n$-1\r\n*-1\r\n"
+        );
+    }
+
+    #[test]
+    fn decodes_a_crlf_framed_command() {
+        assert_eq!(
+            decode_all(b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n").expect("decode"),
+            Some(RespValue::Array(vec![
+                RespValue::BulkString(Bytes::from_static(b"ECHO")),
+                RespValue::BulkString(Bytes::from_static(b"hi")),
+            ]))
+        );
+    }
+
+    #[test]
+    fn round_trips_through_encode_and_decode() {
+        let value = RespValue::Array(vec![
+            RespValue::SimpleString(Bytes::from_static(b"OK")),
+            RespValue::Integer(-7),
+            RespValue::BulkString(Bytes::from_static(b"a\r\nb")),
+            RespValue::NullBulkString,
+            RespValue::NullArray,
+        ]);
+        assert_eq!(
+            decode_all(&value.encode_to_bytes()).expect("decode"),
+            Some(value)
+        );
+    }
+
+    #[test]
+    fn rejects_lf_only_framing() {
+        assert!(decode_all(b"+OK\n").is_err());
     }
 }

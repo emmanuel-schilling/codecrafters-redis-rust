@@ -6,6 +6,10 @@ use std::sync::Arc;
 use strum_macros::{Display, EnumString};
 use tokio::sync::Notify;
 
+// The lint fires on the `#[must_use]` that `async_trait` generates for the boxed
+// future; native async trait methods can't replace it here because handlers are
+// stored as `dyn CommandHandler`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
     async fn handle(
