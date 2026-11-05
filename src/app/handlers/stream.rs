@@ -10,6 +10,7 @@ use crate::app::{
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::{self, Instant};
 
 pub async fn handle(
     parsed: ParsedCommand,
@@ -54,13 +55,19 @@ fn handle_xadd(
         .map(|[field, value]| (field.clone(), value.clone()))
         .collect();
 
-    let added = store.with_keyspace(|ks| {
-        ks.get_or_create_as(key, DataType::as_stream, || DataType::Stream(Stream::new()))?
-            .add(id_spec, fields)
+    let added = store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream)? {
+        Some(stream) => stream.add(id_spec, fields),
+        // Create the stream only once the entry is accepted, so a rejected ID leaves no key.
+        None => {
+            let mut stream = Stream::new();
+            let id = stream.add(id_spec, fields)?;
+            ks.set(key.clone(), DataType::Stream(stream), None);
+            Ok(id)
+        }
     });
     match added {
         Ok(id) => {
-            waiters.notify_one(key);
+            waiters.stream_changed(key);
             RespValue::BulkString(Bytes::from(id.to_string()))
         }
         Err(e) => e.into(),
@@ -102,6 +109,7 @@ async fn handle_xread(
     waiters: &Arc<WaiterRegistry>,
 ) -> RespValue {
     let mut args = parsed.args_from(0);
+    let mut blocking = false;
     let mut block_timeout = None;
 
     if args
@@ -122,6 +130,7 @@ async fn handle_xread(
             ));
         };
 
+        blocking = true;
         block_timeout = if timeout_ms == 0 {
             None
         } else {
@@ -186,26 +195,38 @@ async fn handle_xread(
         })
     };
 
+    // Register before the first read, so an XADD that lands between the read
+    // and the wait still wakes this client.
+    let watch = blocking.then(|| waiters.watch_streams(keys));
+
     match read() {
         Ok(Some(results)) => return format_xread_response(results),
         Ok(None) => {}
         Err(e) => return e.into(),
     }
 
-    if block_timeout.is_none()
-        && parsed
-            .arg(0)
-            .is_none_or(|a| !a.eq_ignore_ascii_case(b"block"))
-    {
-        return RespValue::NullBulkString;
-    }
-
-    waiters.wait_for_any(keys, block_timeout).await;
-
-    match read() {
-        Ok(Some(results)) => format_xread_response(results),
-        Ok(None) => RespValue::NullArray,
-        Err(e) => e.into(),
+    let Some(watch) = watch else {
+        return RespValue::NullArray;
+    };
+    // No deadline for BLOCK 0, or for one too far ahead to represent.
+    let deadline = block_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    loop {
+        match deadline {
+            Some(deadline) => {
+                if time::timeout_at(deadline, watch.changed.notified())
+                    .await
+                    .is_err()
+                {
+                    return RespValue::NullArray;
+                }
+            }
+            None => watch.changed.notified().await,
+        }
+        match read() {
+            Ok(Some(results)) => return format_xread_response(results),
+            Ok(None) => {}
+            Err(e) => return e.into(),
+        }
     }
 }
 
@@ -323,6 +344,57 @@ mod tests {
                     ])]),
                 ]),
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn xadd_wakes_every_blocked_reader() {
+        let store = Arc::new(Store::new());
+        let waiters = Arc::new(WaiterRegistry::new());
+        let read = || {
+            handle(
+                command(&["XREAD", "BLOCK", "0", "STREAMS", "s", "$"]),
+                &store,
+                &waiters,
+            )
+        };
+        let mut first = Box::pin(read());
+        let mut second = Box::pin(read());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        handle(command(&["XADD", "s", "1-1", "a", "1"]), &store, &waiters).await;
+        let expected = RespValue::Array(vec![RespValue::Array(vec![
+            bulk("s"),
+            RespValue::Array(vec![RespValue::Array(vec![
+                bulk("1-1"),
+                RespValue::Array(vec![bulk("a"), bulk("1")]),
+            ])]),
+        ])]);
+        assert_eq!(first.await, expected);
+        assert_eq!(second.await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_xadd_creates_no_key() {
+        let store = Arc::new(Store::new());
+        assert!(matches!(
+            run(&["XADD", "s", "0-0", "a", "1"], &store).await,
+            RespValue::Error(_)
+        ));
+        assert_eq!(
+            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"s"))),
+            "none"
+        );
+    }
+
+    #[tokio::test]
+    async fn xread_without_block_replies_null_array_when_empty() {
+        let store = Arc::new(Store::new());
+        run(&["XADD", "s", "1-1", "a", "1"], &store).await;
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "s", "1-1"], &store).await,
+            RespValue::NullArray
         );
     }
 }

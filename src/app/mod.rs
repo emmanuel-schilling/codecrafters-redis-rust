@@ -143,7 +143,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
             ref mut rx,
         } = state
         {
-            handlers::pubsub::subscribed_loop(
+            let exit = handlers::pubsub::subscribed_loop(
                 &mut framed,
                 subscriptions,
                 tx,
@@ -152,9 +152,13 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                 client_id,
             )
             .await;
-            info!("Client {client_id} disconnected from subscribed mode.");
-            ctx.pubsub.unsubscribe_all(client_id, subscriptions);
-            return;
+            if exit == handlers::pubsub::SubscribedExit::Disconnected {
+                info!("Client {client_id} disconnected from subscribed mode.");
+                ctx.pubsub.unsubscribe_all(client_id, subscriptions);
+                return;
+            }
+            state = ConnectionState::Normal;
+            continue;
         }
 
         match framed.next().await {
@@ -162,10 +166,7 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                 let parsed_command = match ParsedCommand::from_resp(value) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        if let Err(e) = framed
-                            .send(RespValue::Error(Bytes::from(e.to_string())))
-                            .await
-                        {
+                        if let Err(e) = framed.send(e.into()).await {
                             error!("failed to send error response: {e}");
                         }
                         continue;
@@ -174,23 +175,42 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
 
                 if parsed_command.command() == Command::Subscribe {
                     let (tx, rx) = mpsc::channel(128);
-                    let (response, new_subs) = handlers::pubsub::subscribe(
-                        parsed_command,
+                    let mut subscriptions = HashSet::new();
+                    let replies = handlers::pubsub::subscribe(
+                        &parsed_command,
                         &ctx.pubsub,
                         client_id,
-                        tx.clone(),
-                        &HashSet::new(),
+                        &tx,
+                        &mut subscriptions,
                     );
-                    if let Err(e) = framed.send(response).await {
+                    if let Err(e) = handlers::pubsub::send_all(&mut framed, replies).await {
                         error!("failed to send subscribe response: {e}");
+                        ctx.pubsub.unsubscribe_all(client_id, &subscriptions);
                         return;
                     }
-                    state = ConnectionState::Subscribed {
+                    if !subscriptions.is_empty() {
+                        state = ConnectionState::Subscribed {
+                            client_id,
+                            subscriptions,
+                            tx,
+                            rx,
+                        };
+                    }
+                    continue;
+                }
+
+                if parsed_command.command() == Command::Unsubscribe {
+                    // Not subscribed to anything; Redis still replies per channel.
+                    let replies = handlers::pubsub::unsubscribe(
+                        &parsed_command,
+                        &ctx.pubsub,
                         client_id,
-                        subscriptions: new_subs,
-                        tx,
-                        rx,
-                    };
+                        &mut HashSet::new(),
+                    );
+                    if let Err(e) = handlers::pubsub::send_all(&mut framed, replies).await {
+                        error!("failed to send unsubscribe response: {e}");
+                        return;
+                    }
                     continue;
                 }
 
@@ -281,10 +301,16 @@ pub async fn handle_command(
         return handler.handle(ctx, parsed).await;
     }
 
+    let fed_list = matches!(command, Command::LPush | Command::RPush)
+        .then(|| parsed.first().cloned())
+        .flatten();
     let _order = ctx.write_order.lock().await;
     let response = handler.handle(ctx, parsed.clone()).await;
     if let Some(propagated) = propagated_form(parsed, &response) {
         ctx.replication.propagate(propagated);
+        if let Some(key) = fed_list {
+            handlers::list::serve_blocked_clients(ctx, &key);
+        }
     }
     response
 }
@@ -436,5 +462,32 @@ mod tests {
             RespValue::Error(_)
         ));
         assert_eq!(run(&["GET", "a"], &ctx).await, RespValue::NullBulkString);
+    }
+
+    #[tokio::test]
+    async fn a_push_that_serves_a_blocked_client_sends_the_push_then_the_pop() {
+        let (ctx, mut rx) = master_with_replica();
+        let mut blocked = Box::pin(run(&["BLPOP", "q", "0"], &ctx));
+        assert!(futures::poll!(&mut blocked).is_pending());
+
+        run(&["RPUSH", "q", "a"], &ctx).await;
+        assert_eq!(
+            blocked.await,
+            RespValue::Array(vec![
+                RespValue::BulkString(Bytes::from_static(b"q")),
+                RespValue::BulkString(Bytes::from_static(b"a")),
+            ])
+        );
+        assert_eq!(
+            received(&mut rx),
+            vec![
+                command(&["RPUSH", "q", "a"]).into_resp_array(),
+                command(&["LPOP", "q"]).into_resp_array(),
+            ]
+        );
+        assert_eq!(
+            run(&["TYPE", "q"], &ctx).await,
+            RespValue::SimpleString(Bytes::from_static(b"none"))
+        );
     }
 }

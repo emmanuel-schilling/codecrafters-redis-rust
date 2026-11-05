@@ -1,5 +1,6 @@
 use crate::app::{
     command::{Command, ParsedCommand},
+    error::AppError,
     protocol::{RespDecoder, RespValue},
     pubsub::PubSubHub,
 };
@@ -10,6 +11,15 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tracing::error;
+
+/// How a client left subscribed mode.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubscribedExit {
+    /// It unsubscribed from its last channel and continues in normal mode.
+    Unsubscribed,
+    /// It disconnected, or the connection failed.
+    Disconnected,
+}
 
 pub fn publish(parsed: ParsedCommand, pubsub: &PubSubHub) -> RespValue {
     let (Some(channel), Some(message)) = (parsed.arg(0), parsed.arg(1)) else {
@@ -22,66 +32,96 @@ pub fn publish(parsed: ParsedCommand, pubsub: &PubSubHub) -> RespValue {
     RespValue::Integer(subscriber_count as i64)
 }
 
+/// Subscribes to each named channel. Returns one reply per channel, as Redis
+/// sends, each with the number of channels subscribed so far.
 pub fn subscribe(
-    parsed: ParsedCommand,
+    parsed: &ParsedCommand,
     pubsub: &PubSubHub,
     client_id: u64,
-    sender: mpsc::Sender<RespValue>,
-    current_subs: &HashSet<Bytes>,
-) -> (RespValue, HashSet<Bytes>) {
+    sender: &mpsc::Sender<RespValue>,
+    subscriptions: &mut HashSet<Bytes>,
+) -> Vec<RespValue> {
     let channels = parsed.args_from(0);
-    let mut new_subs = HashSet::new();
-    for channel in channels {
-        if !current_subs.contains(channel) {
-            pubsub.subscribe(channel.clone(), client_id, sender.clone());
-            new_subs.insert(channel.clone());
-        }
+    if channels.is_empty() {
+        return vec![RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'subscribe' command",
+        ))];
     }
-
-    let first_channel = channels.first().cloned().unwrap_or_default();
-    let count = current_subs.len() + new_subs.len();
-
-    let response = RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"subscribe")),
-        RespValue::BulkString(first_channel),
-        RespValue::Integer(count as i64),
-    ]);
-    (response, new_subs)
+    channels
+        .iter()
+        .map(|channel| {
+            if subscriptions.insert(channel.clone()) {
+                pubsub.subscribe(channel.clone(), client_id, sender.clone());
+            }
+            subscription_reply(
+                b"subscribe",
+                RespValue::BulkString(channel.clone()),
+                subscriptions,
+            )
+        })
+        .collect()
 }
 
+/// Unsubscribes from each named channel, or from every channel when none are
+/// named. Returns one reply per channel, each with the number left.
 pub fn unsubscribe(
-    parsed: ParsedCommand,
+    parsed: &ParsedCommand,
     pubsub: &PubSubHub,
     client_id: u64,
-    current_subs: &HashSet<Bytes>,
-) -> (RespValue, Vec<Bytes>) {
-    let channels_to_unsub = if parsed.args_from(0).is_empty() {
-        current_subs.iter().cloned().collect()
+    subscriptions: &mut HashSet<Bytes>,
+) -> Vec<RespValue> {
+    let channels: Vec<Bytes> = if parsed.args_from(0).is_empty() {
+        subscriptions.iter().cloned().collect()
     } else {
         parsed.args_from(0).to_vec()
     };
-
-    let mut removed_subs = Vec::new();
-    let mut count = current_subs.len();
-    for channel in &channels_to_unsub {
-        if current_subs.contains(channel) {
-            pubsub.unsubscribe(channel, client_id);
-            removed_subs.push(channel.clone());
-            count -= 1;
-        }
+    if channels.is_empty() {
+        return vec![subscription_reply(
+            b"unsubscribe",
+            RespValue::NullBulkString,
+            subscriptions,
+        )];
     }
-
-    let first_channel = channels_to_unsub.first().cloned().unwrap_or_default();
-    let response = RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"unsubscribe")),
-        RespValue::BulkString(first_channel),
-        RespValue::Integer(count as i64),
-    ]);
-    (response, removed_subs)
+    channels
+        .into_iter()
+        .map(|channel| {
+            if subscriptions.remove(&channel) {
+                pubsub.unsubscribe(&channel, client_id);
+            }
+            subscription_reply(
+                b"unsubscribe",
+                RespValue::BulkString(channel),
+                subscriptions,
+            )
+        })
+        .collect()
 }
 
-/// Serves a client in subscribed mode. Returns when the client disconnects
-/// or the connection fails; the caller then removes its subscriptions.
+fn subscription_reply(
+    kind: &'static [u8],
+    channel: RespValue,
+    subscriptions: &HashSet<Bytes>,
+) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(Bytes::from_static(kind)),
+        channel,
+        RespValue::Integer(subscriptions.len() as i64),
+    ])
+}
+
+/// Sends several replies and flushes once.
+pub async fn send_all(
+    framed: &mut Framed<TcpStream, RespDecoder>,
+    replies: Vec<RespValue>,
+) -> Result<(), AppError> {
+    for reply in replies {
+        framed.feed(reply).await?;
+    }
+    framed.flush().await
+}
+
+/// Serves a client in subscribed mode until it unsubscribes from its last
+/// channel or disconnects.
 pub async fn subscribed_loop(
     framed: &mut Framed<TcpStream, RespDecoder>,
     subscriptions: &mut HashSet<Bytes>,
@@ -89,59 +129,55 @@ pub async fn subscribed_loop(
     rx: &mut mpsc::Receiver<RespValue>,
     pubsub: &PubSubHub,
     client_id: u64,
-) {
+) -> SubscribedExit {
     loop {
         tokio::select! {
             Some(message) = rx.recv() => {
                 if let Err(e) = framed.send(message).await {
                     error!("failed to send published message to client: {e}");
-                    return;
+                    return SubscribedExit::Disconnected;
                 }
             }
             result = framed.next() => {
-                match result {
-                    Some(Ok(value)) => {
-                         let parsed_command = match ParsedCommand::from_resp(value) {
-                             Ok(cmd) => cmd,
-                             Err(e) => {
-                                 if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await { error!("failed to send error response: {e}"); }
-                                 continue;
-                             }
-                         };
-
-                        let cmd = parsed_command.command();
-                        let allowed_in_sub_mode = matches!(cmd, Command::Subscribe | Command::Unsubscribe | Command::Ping);
-
-                        if !allowed_in_sub_mode {
-                             let err_msg = format!("ERR Can't execute '{cmd}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context");
-                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await { error!("failed to send subscribed mode error: {e}"); return; }
-                             continue;
+                let parsed_command = match result {
+                    Some(Ok(value)) => match ParsedCommand::from_resp(value) {
+                        Ok(cmd) => cmd,
+                        Err(e) => {
+                            if let Err(e) = framed.send(e.into()).await {
+                                error!("failed to send error response: {e}");
+                                return SubscribedExit::Disconnected;
+                            }
+                            continue;
                         }
-
-                        let response = if cmd == Command::Subscribe {
-                             let (resp, new_subs) = subscribe(parsed_command, pubsub, client_id, tx.clone(), subscriptions);
-                             subscriptions.extend(new_subs);
-                             resp
-                        } else if cmd == Command::Unsubscribe {
-                             let (resp, removed_subs) = unsubscribe(parsed_command, pubsub, client_id, subscriptions);
-                             for sub in removed_subs {
-                                  subscriptions.remove(&sub);
-                             }
-                             resp
-                        } else if cmd == Command::Ping {
-                             RespValue::Array(vec![
-                                  RespValue::BulkString(Bytes::from_static(b"pong")),
-                                  RespValue::BulkString(Bytes::from_static(b"")),
-                             ])
-                        } else { unreachable!() };
-
-                         if let Err(e) = framed.send(response).await {
-                              error!("failed to send response in subscribed mode: {e}");
-                              return;
-                         }
+                    },
+                    Some(Err(e)) => {
+                        error!("error reading from stream in subscribed mode: {e}");
+                        return SubscribedExit::Disconnected;
                     }
-                    Some(Err(e)) => { error!("error reading from stream in subscribed mode: {e}"); return; }
-                    None => return,
+                    None => return SubscribedExit::Disconnected,
+                };
+
+                let replies = match parsed_command.command() {
+                    Command::Subscribe => {
+                        subscribe(&parsed_command, pubsub, client_id, tx, subscriptions)
+                    }
+                    Command::Unsubscribe => {
+                        unsubscribe(&parsed_command, pubsub, client_id, subscriptions)
+                    }
+                    Command::Ping => vec![RespValue::Array(vec![
+                        RespValue::BulkString(Bytes::from_static(b"pong")),
+                        RespValue::BulkString(Bytes::from_static(b"")),
+                    ])],
+                    cmd => vec![RespValue::Error(Bytes::from(format!(
+                        "ERR Can't execute '{cmd}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"
+                    )))],
+                };
+                if let Err(e) = send_all(framed, replies).await {
+                    error!("failed to send response in subscribed mode: {e}");
+                    return SubscribedExit::Disconnected;
+                }
+                if subscriptions.is_empty() {
+                    return SubscribedExit::Unsubscribed;
                 }
             }
         }
@@ -169,15 +205,18 @@ mod tests {
         let mut subscriptions = HashSet::new();
         drop(client);
 
-        subscribed_loop(
-            &mut framed,
-            &mut subscriptions,
-            &tx,
-            &mut rx,
-            &PubSubHub::new(),
-            1,
-        )
-        .await;
+        assert_eq!(
+            subscribed_loop(
+                &mut framed,
+                &mut subscriptions,
+                &tx,
+                &mut rx,
+                &PubSubHub::new(),
+                1,
+            )
+            .await,
+            SubscribedExit::Disconnected
+        );
     }
 
     #[tokio::test]
@@ -199,15 +238,120 @@ mod tests {
             received
         });
 
-        subscribed_loop(
-            &mut framed,
-            &mut subscriptions,
-            &tx,
-            &mut rx,
-            &PubSubHub::new(),
-            1,
-        )
-        .await;
+        assert_eq!(
+            subscribed_loop(
+                &mut framed,
+                &mut subscriptions,
+                &tx,
+                &mut rx,
+                &PubSubHub::new(),
+                1,
+            )
+            .await,
+            SubscribedExit::Disconnected
+        );
         assert_eq!(client_task.await.expect("client task"), message);
+    }
+
+    fn command(parts: &[&str]) -> ParsedCommand {
+        ParsedCommand::from_resp(RespValue::Array(
+            parts
+                .iter()
+                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect(),
+        ))
+        .expect("valid command")
+    }
+
+    fn reply(kind: &str, channel: Option<&str>, count: i64) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::BulkString(Bytes::copy_from_slice(kind.as_bytes())),
+            channel.map_or(RespValue::NullBulkString, |c| {
+                RespValue::BulkString(Bytes::copy_from_slice(c.as_bytes()))
+            }),
+            RespValue::Integer(count),
+        ])
+    }
+
+    #[test]
+    fn replies_once_per_channel_with_running_counts() {
+        let hub = PubSubHub::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let mut subs = HashSet::new();
+        assert_eq!(
+            subscribe(
+                &command(&["SUBSCRIBE", "a", "b", "a"]),
+                &hub,
+                1,
+                &tx,
+                &mut subs
+            ),
+            vec![
+                reply("subscribe", Some("a"), 1),
+                reply("subscribe", Some("b"), 2),
+                reply("subscribe", Some("a"), 2),
+            ]
+        );
+        assert_eq!(
+            unsubscribe(&command(&["UNSUBSCRIBE", "b", "zzz"]), &hub, 1, &mut subs),
+            vec![
+                reply("unsubscribe", Some("b"), 1),
+                reply("unsubscribe", Some("zzz"), 1),
+            ]
+        );
+        assert_eq!(
+            unsubscribe(&command(&["UNSUBSCRIBE"]), &hub, 1, &mut subs),
+            vec![reply("unsubscribe", Some("a"), 0)]
+        );
+        assert_eq!(
+            unsubscribe(&command(&["UNSUBSCRIBE"]), &hub, 1, &mut subs),
+            vec![reply("unsubscribe", None, 0)]
+        );
+        assert!(matches!(
+            subscribe(&command(&["SUBSCRIBE"]), &hub, 1, &tx, &mut subs)[..],
+            [RespValue::Error(_)]
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsubscribing_from_the_last_channel_leaves_subscribed_mode() {
+        let (client, mut framed) = connected_pair().await;
+        let hub = PubSubHub::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut subscriptions = HashSet::new();
+        subscribe(
+            &command(&["SUBSCRIBE", "a", "b"]),
+            &hub,
+            1,
+            &tx,
+            &mut subscriptions,
+        );
+
+        let client_task = tokio::spawn(async move {
+            let mut client = Framed::new(client, RespDecoder);
+            client
+                .send(command(&["UNSUBSCRIBE"]).into_resp_array())
+                .await
+                .expect("send");
+            let first = client.next().await.expect("frame").expect("decode");
+            let second = client.next().await.expect("frame").expect("decode");
+            (first, second, client)
+        });
+
+        assert_eq!(
+            subscribed_loop(&mut framed, &mut subscriptions, &tx, &mut rx, &hub, 1).await,
+            SubscribedExit::Unsubscribed
+        );
+        let (first, second, _client) = client_task.await.expect("client task");
+        let mut counts = [first, second].map(|r| match r {
+            RespValue::Array(parts) => parts[2].clone(),
+            other => panic!("unexpected reply {other:?}"),
+        });
+        counts.sort_by_key(|c| format!("{c:?}"));
+        assert_eq!(counts, [RespValue::Integer(0), RespValue::Integer(1)]);
+        assert_eq!(
+            hub.publish(Bytes::from_static(b"a"), Bytes::from_static(b"m")),
+            0
+        );
     }
 }

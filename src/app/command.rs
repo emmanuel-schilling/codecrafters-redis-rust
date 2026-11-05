@@ -147,3 +147,21 @@ impl ParsedCommand {
         RespValue::Array(parts)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_commands_get_an_err_reply() {
+        let unknown = RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"ACL")),
+            RespValue::BulkString(Bytes::from_static(b"WHOAMI")),
+        ]);
+        let error = ParsedCommand::from_resp(unknown).expect_err("ACL is not supported");
+        assert_eq!(
+            RespValue::from(error),
+            RespValue::Error(Bytes::from_static(b"ERR unknown command 'ACL'"))
+        );
+    }
+}

@@ -97,10 +97,11 @@ impl Stream {
     /// Generates a new StreamId based on the provided spec and the stream's state.
     fn generate_id(&self, id_spec: &str) -> Result<StreamId, AppError> {
         if id_spec == "*" {
+            // A clock set before 1970 counts as time 0; IDs still increase
+            // because of the checks against the last ID below.
             let mut ms_time = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
+                .map_or(0, |since_epoch| since_epoch.as_millis() as u64);
             let mut seq_no = 0;
             if ms_time == self.last_generated_id.ms_time {
                 seq_no = self.last_generated_id.seq_no + 1;

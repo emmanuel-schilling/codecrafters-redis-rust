@@ -4,7 +4,7 @@ use crate::app::{
     error::AppError,
     protocol::RespValue,
     store::{resolve_range, DataType, Store},
-    wait::WaiterRegistry,
+    wait::Popped,
     AppContext,
 };
 use bytes::Bytes;
@@ -12,10 +12,10 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 pub async fn handle(parsed: ParsedCommand, ctx: &AppContext) -> RespValue {
-    let (store, waiters) = (&ctx.store, &ctx.waiters);
+    let store = &ctx.store;
     match parsed.command() {
-        Command::LPush => handle_push(parsed, store, waiters, true),
-        Command::RPush => handle_push(parsed, store, waiters, false),
+        Command::LPush => handle_push(parsed, store, true),
+        Command::RPush => handle_push(parsed, store, false),
         Command::LPop => handle_lpop(parsed, store),
         Command::LLen => handle_llen(parsed, store),
         Command::LRange => handle_lrange(parsed, store),
@@ -24,12 +24,7 @@ pub async fn handle(parsed: ParsedCommand, ctx: &AppContext) -> RespValue {
     }
 }
 
-fn handle_push(
-    parsed: ParsedCommand,
-    store: &Store,
-    waiters: &WaiterRegistry,
-    left: bool,
-) -> RespValue {
+fn handle_push(parsed: ParsedCommand, store: &Store, left: bool) -> RespValue {
     let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
@@ -52,10 +47,7 @@ fn handle_push(
     });
 
     match pushed {
-        Ok(len) => {
-            waiters.notify_one(key);
-            RespValue::Integer(len as i64)
-        }
+        Ok(len) => RespValue::Integer(len as i64),
         Err(e) => e.into(),
     }
 }
@@ -64,25 +56,41 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
-    let count = parsed
-        .arg(1)
-        .and_then(|s| std::str::from_utf8(s).ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1);
+    // With a count, LPOP always replies with an array (or a null array).
+    let count = match parsed.arg(1) {
+        None => None,
+        Some(arg) => match std::str::from_utf8(arg)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(count) => Some(count),
+            None => {
+                return RespValue::Error(Bytes::from_static(
+                    b"ERR value is out of range, must be positive",
+                ))
+            }
+        },
+    };
 
     store.with_keyspace(|ks| {
         let list = match ks.get_as(key, DataType::as_list) {
             Ok(Some(list)) => list,
+            Ok(None) if count.is_some() => return RespValue::NullArray,
             Ok(None) => return RespValue::NullBulkString,
             Err(e) => return e.into(),
         };
-        let mut popped: Vec<Bytes> = list.drain(..count.min(list.len())).collect();
+        let reply = match count {
+            None => list
+                .pop_front()
+                .map_or(RespValue::NullBulkString, RespValue::BulkString),
+            Some(count) => RespValue::Array(
+                list.drain(..count.min(list.len()))
+                    .map(RespValue::BulkString)
+                    .collect(),
+            ),
+        };
         ks.remove_if_empty(key);
-        if count == 1 && popped.len() == 1 {
-            RespValue::BulkString(popped.swap_remove(0))
-        } else {
-            RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect())
-        }
+        reply
     })
 }
 
@@ -95,48 +103,68 @@ async fn handle_blpop(parsed: ParsedCommand, ctx: &AppContext) -> RespValue {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let timeout_secs = match std::str::from_utf8(timeout_str)
+    let invalid_timeout = || {
+        RespValue::Error(Bytes::from_static(
+            b"ERR timeout is not a float or out of range",
+        ))
+    };
+    let timeout = match std::str::from_utf8(timeout_str)
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
     {
-        Some(t) => t,
-        None => {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR timeout is not a float or out of range",
-            ))
+        None => return invalid_timeout(),
+        Some(secs) if secs < 0.0 => {
+            return RespValue::Error(Bytes::from_static(b"ERR timeout is negative"))
         }
+        Some(0.0) => None,
+        Some(secs) => match Duration::try_from_secs_f64(secs) {
+            Ok(timeout) => Some(timeout),
+            Err(_) => return invalid_timeout(),
+        },
     };
 
-    if let Some((key, value)) = pop_first(ctx, keys).await {
-        return RespValue::Array(vec![
-            RespValue::BulkString(key),
-            RespValue::BulkString(value),
-        ]);
-    }
-
-    let timeout = if timeout_secs == 0.0 {
-        None
-    } else {
-        Some(Duration::from_secs_f64(timeout_secs))
+    // Check and register under the write-order lock, which every push also
+    // holds: a push either lands first (and is popped here) or after (and
+    // hands its element to this client).
+    let mut wait = {
+        let _order = ctx.write_order.lock().await;
+        if let Some(popped) = pop_first(ctx, keys) {
+            return blpop_reply(popped);
+        }
+        ctx.waiters.block_on_lists(keys)
     };
 
-    ctx.waiters.wait_for_any(keys, timeout).await;
+    let delivered = match timeout {
+        None => (&mut wait.delivery).await.ok(),
+        Some(timeout) => match tokio::time::timeout(timeout, &mut wait.delivery).await {
+            Ok(delivered) => delivered.ok(),
+            Err(_) if wait.waiter.cancel() => None,
+            // An element was handed over just as the timeout expired: take it.
+            Err(_) => (&mut wait.delivery).await.ok(),
+        },
+    };
+    delivered.map_or(RespValue::NullArray, blpop_reply)
+}
 
-    if let Some((key, value)) = pop_first(ctx, keys).await {
-        RespValue::Array(vec![
-            RespValue::BulkString(key),
-            RespValue::BulkString(value),
-        ])
-    } else {
-        RespValue::NullArray
-    }
+fn blpop_reply((key, value): Popped) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(key),
+        RespValue::BulkString(value),
+    ])
+}
+
+/// The LPOP that replicas apply for an element popped from `key` by BLPOP.
+fn lpop_for_replicas(key: &Bytes) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(Bytes::from_static(b"LPOP")),
+        RespValue::BulkString(key.clone()),
+    ])
 }
 
 /// Pops from the first key holding a non-empty list (keys of other types are
 /// skipped) and sends the pop to replicas as LPOP, which never blocks there.
-/// Runs under the write-order lock, as every other write does.
-async fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<(Bytes, Bytes)> {
-    let _order = ctx.write_order.lock().await;
+/// The caller holds the write-order lock.
+fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<Popped> {
     let popped = ctx.store.with_keyspace(|ks| {
         for key in keys {
             if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
@@ -149,12 +177,27 @@ async fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<(Bytes, Bytes)> {
         None
     });
     if let Some((key, _)) = &popped {
-        ctx.replication.propagate(RespValue::Array(vec![
-            RespValue::BulkString(Bytes::from_static(b"LPOP")),
-            RespValue::BulkString(key.clone()),
-        ]));
+        ctx.replication.propagate(lpop_for_replicas(key));
     }
     popped
+}
+
+/// Hands elements of `key` to clients blocked on it, oldest first, as Redis
+/// does right after a command that adds to a list. Each hand-over is sent to
+/// replicas as LPOP. The caller holds the write-order lock and has already
+/// propagated the command that added the elements.
+pub fn serve_blocked_clients(ctx: &AppContext, key: &Bytes) {
+    let served = ctx.store.with_keyspace(|ks| {
+        let Ok(Some(list)) = ks.get_as(key, DataType::as_list) else {
+            return 0;
+        };
+        let served = ctx.waiters.serve_list(key, list);
+        ks.remove_if_empty(key);
+        served
+    });
+    for _ in 0..served {
+        ctx.replication.propagate(lpop_for_replicas(key));
+    }
 }
 
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
@@ -295,5 +338,76 @@ mod tests {
         });
         assert_eq!(run(&["RPUSH", "k", "x"], &ctx).await, RespValue::Integer(1));
         assert_eq!(run(&["LRANGE", "k", "0", "-1"], &ctx).await, bulks(&["x"]));
+    }
+
+    #[tokio::test]
+    async fn blocked_clients_are_served_in_arrival_order() {
+        let ctx = crate::app::test_context();
+        let mut first = Box::pin(run_command(&["BLPOP", "q", "0"], &ctx));
+        let mut second = Box::pin(run_command(&["BLPOP", "q", "0"], &ctx));
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+
+        run_command(&["RPUSH", "q", "a", "b", "c"], &ctx).await;
+        assert_eq!(first.await, bulks(&["q", "a"]));
+        assert_eq!(second.await, bulks(&["q", "b"]));
+        assert_eq!(run(&["LRANGE", "q", "0", "-1"], &ctx).await, bulks(&["c"]));
+    }
+
+    #[tokio::test]
+    async fn blpop_rejects_a_negative_timeout() {
+        let ctx = crate::app::test_context();
+        assert_eq!(
+            run(&["BLPOP", "q", "-1"], &ctx).await,
+            RespValue::Error(Bytes::from_static(b"ERR timeout is negative"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_blpop_leaves_no_registration() {
+        let ctx = crate::app::test_context();
+        assert_eq!(
+            run(&["BLPOP", "q", "0.01"], &ctx).await,
+            RespValue::NullArray
+        );
+        run_command(&["RPUSH", "q", "x"], &ctx).await;
+        assert_eq!(run(&["LLEN", "q"], &ctx).await, RespValue::Integer(1));
+    }
+
+    /// Runs a command through the full write path, as a client connection does.
+    async fn run_command(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
+        let command = ParsedCommand::from_resp(RespValue::Array(
+            parts
+                .iter()
+                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect(),
+        ))
+        .expect("valid command");
+        crate::app::handle_command(
+            command,
+            ctx,
+            &mut crate::app::ConnectionState::Normal,
+            &mut vec![],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn lpop_with_a_count_always_replies_with_an_array() {
+        let ctx = crate::app::test_context();
+        run(&["RPUSH", "l", "a", "b"], &ctx).await;
+        assert_eq!(run(&["LPOP", "l", "1"], &ctx).await, bulks(&["a"]));
+        assert_eq!(
+            run(&["LPOP", "l"], &ctx).await,
+            RespValue::BulkString(Bytes::from_static(b"b"))
+        );
+        assert_eq!(run(&["LPOP", "l", "2"], &ctx).await, RespValue::NullArray);
+        assert_eq!(run(&["LPOP", "l"], &ctx).await, RespValue::NullBulkString);
+        assert_eq!(
+            run(&["LPOP", "l", "-1"], &ctx).await,
+            RespValue::Error(Bytes::from_static(
+                b"ERR value is out of range, must be positive"
+            ))
+        );
     }
 }

@@ -8,11 +8,11 @@ pub enum AppError {
     Incomplete,
 
     /// An error encountered during protocol parsing.
-    #[error("protocol parse error: {0}")]
+    #[error("ERR Protocol error: {0}")]
     ParseError(String),
 
     /// An unknown command was received.
-    #[error("unknown command: {0}")]
+    #[error("ERR unknown command '{0}'")]
     UnknownCommand(String),
 
     /// An I/O error from the underlying transport.

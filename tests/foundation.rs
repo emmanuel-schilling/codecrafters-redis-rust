@@ -1,7 +1,5 @@
 use codecrafters_redis::foundation::{net, shutdown};
-use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time;
 
 #[tokio::test]
 async fn test_server_starts_and_accepts_connection() {
@@ -9,10 +7,8 @@ async fn test_server_starts_and_accepts_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // Arrange: Create a shutdown future that will never complete for this test.
-    let shutdown_future = async {
-        time::sleep(Duration::from_secs(10)).await;
-    };
+    // Arrange: Create a shutdown future that never completes.
+    let shutdown_future = std::future::pending::<()>();
 
     // Arrange: Define a no-op connection handler for this foundation-level test.
     // It accepts the stream and immediately completes, doing no work.
@@ -26,9 +22,8 @@ async fn test_server_starts_and_accepts_connection() {
         no_op_handler,
     ));
 
-    // Give the server a moment to start up.
-    time::sleep(Duration::from_millis(100)).await;
-
+    // No wait is needed: the listener is already bound, so the connection is
+    // queued until the server task accepts it.
     // Act & Assert: Attempt to connect to the server.
     match TcpStream::connect(addr).await {
         Ok(_) => {

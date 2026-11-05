@@ -1,8 +1,13 @@
 use crate::foundation::shutdown::Shutdown;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tracing::info;
+use tracing::{error, info};
+
+/// Pause after a failed accept, which is usually temporary (for example, out
+/// of file descriptors), so the loop doesn't spin while the cause persists.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Runs the main server loop.
 ///
@@ -22,7 +27,14 @@ where
 
     loop {
         let (stream, addr) = tokio::select! {
-            res = listener.accept() => res?,
+            res = listener.accept() => match res {
+                Ok(connection) => connection,
+                Err(e) => {
+                    error!("failed to accept a connection: {e}");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+            },
             _ = shutdown.wait_for_signal() => {
                 info!("shutting down server");
                 break;
