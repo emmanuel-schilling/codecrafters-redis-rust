@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tracing::{error, info};
 
@@ -42,6 +42,9 @@ pub struct AppContext {
     pub pubsub: Arc<PubSubHub>,
     pub waiters: Arc<WaiterRegistry>,
     pub registry: CommandRegistry,
+    /// Held while a write runs and is sent to replicas, so replicas receive
+    /// writes in the order this server applied them.
+    pub write_order: tokio::sync::Mutex<()>,
 }
 
 impl AppContext {
@@ -110,6 +113,7 @@ impl AppContext {
             pubsub,
             waiters,
             registry,
+            write_order: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -130,7 +134,6 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
     let mut command_queue: Vec<ParsedCommand> = Vec::new();
-    let wait_notify = Arc::new(Notify::new());
 
     loop {
         if let ConnectionState::Subscribed {
@@ -207,26 +210,20 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                         return;
                     }
 
-                    let (tx, rx) = mpsc::channel(128);
-                    let ack_offset = ctx.replication.add_replica(tx).await;
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let ack_offset = ctx.replication.add_replica(tx);
                     tokio::spawn(replication::serve_replica(
                         rx,
                         framed,
                         ack_offset,
-                        Arc::clone(&wait_notify),
+                        Arc::clone(&ctx.replication),
                     ));
                     info!("Connection transitioned to replica serving mode, breaking main loop.");
                     return;
                 }
 
-                let response = handle_command(
-                    parsed_command,
-                    &ctx,
-                    &mut state,
-                    &mut command_queue,
-                    &wait_notify,
-                )
-                .await;
+                let response =
+                    handle_command(parsed_command, &ctx, &mut state, &mut command_queue).await;
 
                 if let Err(e) = framed.send(response).await {
                     error!("failed to send response: {e}");
@@ -242,16 +239,11 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
     }
 }
 
+/// Runs a command received from the master on a replica.
 pub async fn apply_command(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-    let command = parsed.command();
-    let wait_notify = Arc::new(Notify::new()); // Dummy notify for non-connection-based apply
-    if let Some(handler) = ctx.registry.get(&command) {
-        handler.handle(ctx, parsed, &wait_notify).await
-    } else {
-        RespValue::Error(Bytes::from(format!(
-            "ERR unknown command '{}'",
-            parsed.command()
-        )))
+    match ctx.registry.get(&parsed.command()) {
+        Some(handler) => handler.handle(ctx, parsed).await,
+        None => unknown_command(&parsed),
     }
 }
 
@@ -260,10 +252,9 @@ pub async fn handle_command(
     ctx: &Arc<AppContext>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
-    wait_notify: &Arc<Notify>,
 ) -> RespValue {
     if let Some(response) =
-        handlers::transaction::handle_state(parsed.clone(), state, queue, ctx, wait_notify).await
+        handlers::transaction::handle_state(parsed.clone(), state, queue, ctx).await
     {
         return response;
     }
@@ -274,34 +265,176 @@ pub async fn handle_command(
     }
 
     let command = parsed.command();
-
-    let is_write_command = matches!(
-        command,
-        Command::Set
-            | Command::LPush
-            | Command::RPush
-            | Command::LPop
-            | Command::Incr
-            | Command::XAdd
-            | Command::ZAdd
-            | Command::ZRem
-            | Command::GeoAdd
-    );
-    if is_write_command {
-        if ctx.replication.role() == replication::Role::Replica {
-            return RespValue::Error(Bytes::from_static(
-                b"READONLY You can't write against a read only replica.",
-            ));
-        }
-        Arc::clone(&ctx.replication).propagate(parsed.clone());
+    if command.is_write() && ctx.replication.role() == replication::Role::Replica {
+        return RespValue::Error(Bytes::from_static(
+            b"READONLY You can't write against a read only replica.",
+        ));
     }
 
-    if let Some(handler) = ctx.registry.get(&command) {
-        handler.handle(ctx, parsed, wait_notify).await
-    } else {
-        RespValue::Error(Bytes::from(format!(
-            "ERR unknown command '{}'",
-            parsed.command()
-        )))
+    let Some(handler) = ctx.registry.get(&command) else {
+        return unknown_command(&parsed);
+    };
+
+    // BLPOP may block, so it can't hold the write-order lock while it waits;
+    // it takes the lock around each pop and propagates the pop itself.
+    if !command.is_write() || command == Command::BLPop {
+        return handler.handle(ctx, parsed).await;
+    }
+
+    let _order = ctx.write_order.lock().await;
+    let response = handler.handle(ctx, parsed.clone()).await;
+    if let Some(propagated) = propagated_form(parsed, &response) {
+        ctx.replication.propagate(propagated);
+    }
+    response
+}
+
+/// The command replicas apply for a write that replied `response`, or `None`
+/// if the write failed and changed nothing.
+fn propagated_form(parsed: ParsedCommand, response: &RespValue) -> Option<RespValue> {
+    match response {
+        RespValue::Error(_) => None,
+        // An ID generated here (`*` or `<ms>-*`) must be the same on replicas.
+        RespValue::BulkString(id) if parsed.command() == Command::XAdd => {
+            Some(parsed.with_arg(1, id.clone()).into_resp_array())
+        }
+        _ => Some(parsed.into_resp_array()),
+    }
+}
+
+fn unknown_command(parsed: &ParsedCommand) -> RespValue {
+    RespValue::Error(Bytes::from(format!(
+        "ERR unknown command '{}'",
+        parsed.command()
+    )))
+}
+
+/// A master's context with default config, for unit tests.
+#[cfg(test)]
+pub(crate) fn test_context() -> Arc<AppContext> {
+    use clap::Parser;
+    let config = Arc::new(Config::parse_from(["redis"]));
+    Arc::new(AppContext::new(
+        Arc::new(Store::new()),
+        Arc::clone(&config),
+        Arc::new(ReplicationState::new_from_config(&config)),
+        Arc::new(PubSubHub::new()),
+        Arc::new(WaiterRegistry::new()),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(parts: &[&str]) -> ParsedCommand {
+        ParsedCommand::from_resp(RespValue::Array(
+            parts
+                .iter()
+                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect(),
+        ))
+        .expect("valid command")
+    }
+
+    async fn run(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
+        handle_command(
+            command(parts),
+            ctx,
+            &mut ConnectionState::Normal,
+            &mut vec![],
+        )
+        .await
+    }
+
+    /// A master context with one connected replica, whose channel is returned.
+    fn master_with_replica() -> (Arc<AppContext>, mpsc::UnboundedReceiver<RespValue>) {
+        let ctx = test_context();
+        let (tx, rx) = mpsc::unbounded_channel();
+        ctx.replication.add_replica(tx);
+        (ctx, rx)
+    }
+
+    fn received(rx: &mut mpsc::UnboundedReceiver<RespValue>) -> Vec<RespValue> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn sends_only_successful_writes_in_their_applied_form() {
+        let (ctx, mut rx) = master_with_replica();
+        run(&["SET", "a", "1"], &ctx).await;
+        run(&["GET", "a"], &ctx).await;
+        run(&["LPUSH", "a", "x"], &ctx).await; // WRONGTYPE: not sent
+        let RespValue::BulkString(id) = run(&["XADD", "s", "*", "f", "v"], &ctx).await else {
+            panic!("XADD failed");
+        };
+        run(&["RPUSH", "q", "x"], &ctx).await;
+        run(&["BLPOP", "q", "0"], &ctx).await;
+
+        let id = String::from_utf8(id.to_vec()).expect("utf8 id");
+        let expected: Vec<RespValue> = [
+            command(&["SET", "a", "1"]),
+            command(&["XADD", "s", &id, "f", "v"]),
+            command(&["RPUSH", "q", "x"]),
+            command(&["LPOP", "q"]),
+        ]
+        .into_iter()
+        .map(ParsedCommand::into_resp_array)
+        .collect();
+        let sent = received(&mut rx);
+        assert_eq!(sent, expected);
+
+        let sent_bytes: usize = sent.iter().map(|c| c.encode_to_bytes().len()).sum();
+        assert_eq!(ctx.replication.master_repl_offset(), sent_bytes);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_reach_replicas_in_applied_order() {
+        let (ctx, mut rx) = master_with_replica();
+        let tasks: Vec<_> = (0..50)
+            .map(|i| {
+                let ctx = Arc::clone(&ctx);
+                tokio::spawn(async move { run(&["SET", "k", &i.to_string()], &ctx).await })
+            })
+            .collect();
+        for task in tasks {
+            task.await.expect("task");
+        }
+
+        let sent = received(&mut rx);
+        assert_eq!(sent.len(), 50);
+        let RespValue::BulkString(final_value) = run(&["GET", "k"], &ctx).await else {
+            panic!("GET failed");
+        };
+        let last_sent = sent.last().cloned().expect("a write was sent");
+        assert_eq!(
+            last_sent,
+            command(&["SET", "k", &String::from_utf8_lossy(&final_value)]).into_resp_array()
+        );
+    }
+
+    #[tokio::test]
+    async fn replicas_reject_writes_from_clients() {
+        let config = Arc::new(<Config as clap::Parser>::parse_from([
+            "redis",
+            "--replicaof",
+            "localhost 6379",
+        ]));
+        let ctx = Arc::new(AppContext::new(
+            Arc::new(Store::new()),
+            Arc::clone(&config),
+            Arc::new(ReplicationState::new_from_config(&config)),
+            Arc::new(PubSubHub::new()),
+            Arc::new(WaiterRegistry::new()),
+        ));
+        assert!(matches!(
+            run(&["BLPOP", "q", "0"], &ctx).await,
+            RespValue::Error(_)
+        ));
+        assert!(matches!(
+            run(&["SET", "a", "1"], &ctx).await,
+            RespValue::Error(_)
+        ));
+        assert_eq!(run(&["GET", "a"], &ctx).await, RespValue::NullBulkString);
     }
 }

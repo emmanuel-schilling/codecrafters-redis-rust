@@ -5,24 +5,21 @@ use crate::app::{
     protocol::RespValue,
     store::{resolve_range, DataType, Store},
     wait::WaiterRegistry,
+    AppContext,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::Duration;
 
-pub async fn handle(
-    parsed: ParsedCommand,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-) -> RespValue {
+pub async fn handle(parsed: ParsedCommand, ctx: &AppContext) -> RespValue {
+    let (store, waiters) = (&ctx.store, &ctx.waiters);
     match parsed.command() {
         Command::LPush => handle_push(parsed, store, waiters, true),
         Command::RPush => handle_push(parsed, store, waiters, false),
         Command::LPop => handle_lpop(parsed, store),
         Command::LLen => handle_llen(parsed, store),
         Command::LRange => handle_lrange(parsed, store),
-        Command::BLPop => handle_blpop(parsed, store, waiters).await,
+        Command::BLPop => handle_blpop(parsed, ctx).await,
         _ => RespValue::Error(Bytes::from_static(b"ERR unknown list command")),
     }
 }
@@ -89,7 +86,7 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
     })
 }
 
-async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> RespValue {
+async fn handle_blpop(parsed: ParsedCommand, ctx: &AppContext) -> RespValue {
     let Some((keys, timeout_str)) = parsed
         .args_from(0)
         .split_last()
@@ -110,22 +107,7 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     };
 
-    // Pops from the first key holding a non-empty list; keys of other types are skipped.
-    let try_pop = || {
-        store.with_keyspace(|ks| {
-            for key in keys {
-                if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
-                    if let Some(value) = list.pop_front() {
-                        ks.remove_if_empty(key);
-                        return Some((key.clone(), value));
-                    }
-                }
-            }
-            None
-        })
-    };
-
-    if let Some((key, value)) = try_pop() {
+    if let Some((key, value)) = pop_first(ctx, keys).await {
         return RespValue::Array(vec![
             RespValue::BulkString(key),
             RespValue::BulkString(value),
@@ -138,9 +120,9 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         Some(Duration::from_secs_f64(timeout_secs))
     };
 
-    waiters.wait_for_any(keys, timeout).await;
+    ctx.waiters.wait_for_any(keys, timeout).await;
 
-    if let Some((key, value)) = try_pop() {
+    if let Some((key, value)) = pop_first(ctx, keys).await {
         RespValue::Array(vec![
             RespValue::BulkString(key),
             RespValue::BulkString(value),
@@ -148,6 +130,31 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
     } else {
         RespValue::NullArray
     }
+}
+
+/// Pops from the first key holding a non-empty list (keys of other types are
+/// skipped) and sends the pop to replicas as LPOP, which never blocks there.
+/// Runs under the write-order lock, as every other write does.
+async fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<(Bytes, Bytes)> {
+    let _order = ctx.write_order.lock().await;
+    let popped = ctx.store.with_keyspace(|ks| {
+        for key in keys {
+            if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
+                if let Some(value) = list.pop_front() {
+                    ks.remove_if_empty(key);
+                    return Some((key.clone(), value));
+                }
+            }
+        }
+        None
+    });
+    if let Some((key, _)) = &popped {
+        ctx.replication.propagate(RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"LPOP")),
+            RespValue::BulkString(key.clone()),
+        ]));
+    }
+    popped
 }
 
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
@@ -211,8 +218,9 @@ fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
-    async fn run(parts: &[&str], store: &Arc<Store>) -> RespValue {
+    async fn run(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue {
         let command = ParsedCommand::from_resp(RespValue::Array(
             parts
                 .iter()
@@ -220,7 +228,7 @@ mod tests {
                 .collect(),
         ))
         .expect("valid command");
-        handle(command, store, &Arc::new(WaiterRegistry::new())).await
+        handle(command, ctx).await
     }
 
     fn bulks(items: &[&str]) -> RespValue {
@@ -234,8 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn lrange_resolves_negative_and_out_of_range_indexes() {
-        let store = Arc::new(Store::new());
-        run(&["RPUSH", "l", "a", "b", "c"], &store).await;
+        let ctx = crate::app::test_context();
+        run(&["RPUSH", "l", "a", "b", "c"], &ctx).await;
         let cases: [(&str, &str, &[&str]); 7] = [
             ("0", "-1", &["a", "b", "c"]),
             ("-2", "-1", &["b", "c"]),
@@ -247,7 +255,7 @@ mod tests {
         ];
         for (start, stop, expected) in cases {
             assert_eq!(
-                run(&["LRANGE", "l", start, stop], &store).await,
+                run(&["LRANGE", "l", start, stop], &ctx).await,
                 bulks(expected),
                 "LRANGE l {start} {stop}"
             );
@@ -256,40 +264,36 @@ mod tests {
 
     #[tokio::test]
     async fn popping_the_last_element_deletes_the_list() {
-        let store = Arc::new(Store::new());
-        run(&["RPUSH", "l", "a", "b"], &store).await;
-        assert_eq!(run(&["LPOP", "l", "2"], &store).await, bulks(&["a", "b"]));
+        let ctx = crate::app::test_context();
+        run(&["RPUSH", "l", "a", "b"], &ctx).await;
+        assert_eq!(run(&["LPOP", "l", "2"], &ctx).await, bulks(&["a", "b"]));
         assert_eq!(
-            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"l"))),
+            ctx.store
+                .with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"l"))),
             "none"
         );
 
-        run(&["RPUSH", "m", "x"], &store).await;
-        assert_eq!(run(&["BLPOP", "m", "0"], &store).await, bulks(&["m", "x"]));
+        run(&["RPUSH", "m", "x"], &ctx).await;
+        assert_eq!(run(&["BLPOP", "m", "0"], &ctx).await, bulks(&["m", "x"]));
         assert_eq!(
-            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"m"))),
+            ctx.store
+                .with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"m"))),
             "none"
         );
     }
 
     #[tokio::test]
     async fn push_replaces_an_expired_key_of_another_type() {
-        let store = Arc::new(Store::new());
+        let ctx = crate::app::test_context();
         let past = std::time::Instant::now().checked_sub(Duration::from_secs(1));
-        store.with_keyspace(|ks| {
+        ctx.store.with_keyspace(|ks| {
             ks.set(
                 Bytes::from_static(b"k"),
                 DataType::String(Bytes::from_static(b"old")),
                 past,
             )
         });
-        assert_eq!(
-            run(&["RPUSH", "k", "x"], &store).await,
-            RespValue::Integer(1)
-        );
-        assert_eq!(
-            run(&["LRANGE", "k", "0", "-1"], &store).await,
-            bulks(&["x"])
-        );
+        assert_eq!(run(&["RPUSH", "k", "x"], &ctx).await, RespValue::Integer(1));
+        assert_eq!(run(&["LRANGE", "k", "0", "-1"], &ctx).await, bulks(&["x"]));
     }
 }

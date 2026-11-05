@@ -4,16 +4,10 @@ use bytes::Bytes;
 use std::str::FromStr;
 use std::sync::Arc;
 use strum_macros::{Display, EnumString};
-use tokio::sync::Notify;
 
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
-    async fn handle(
-        &self,
-        ctx: &Arc<AppContext>,
-        parsed: ParsedCommand,
-        wait_notify: &Arc<Notify>,
-    ) -> RespValue;
+    async fn handle(&self, ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Display, EnumString)]
@@ -58,6 +52,26 @@ pub enum Command {
     GeoPos,
     GeoDist,
     GeoSearch,
+}
+
+impl Command {
+    /// Whether the command can change the keyspace. Replicas reject these from
+    /// clients, and a master sends them to its replicas once they succeed.
+    pub fn is_write(self) -> bool {
+        matches!(
+            self,
+            Command::Set
+                | Command::Incr
+                | Command::LPush
+                | Command::RPush
+                | Command::LPop
+                | Command::BLPop
+                | Command::XAdd
+                | Command::ZAdd
+                | Command::ZRem
+                | Command::GeoAdd
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +128,14 @@ impl ParsedCommand {
         } else {
             &self.args[start_index..]
         }
+    }
+
+    /// Replaces argument `index`, if the command has one.
+    pub fn with_arg(mut self, index: usize, value: Bytes) -> Self {
+        if let Some(arg) = self.args.get_mut(index) {
+            *arg = value;
+        }
+        self
     }
 
     pub fn into_resp_array(self) -> RespValue {

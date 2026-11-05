@@ -1,14 +1,12 @@
 use crate::app::{command::ParsedCommand, AppContext, ConnectionState, RespValue};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::Notify;
 
 pub async fn handle_state(
     parsed: ParsedCommand,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
     ctx: &Arc<AppContext>,
-    wait_notify: &Arc<Notify>,
 ) -> Option<RespValue> {
     match parsed.command() {
         crate::app::command::Command::Multi => {
@@ -35,7 +33,6 @@ pub async fn handle_state(
                     ctx,
                     &mut ConnectionState::Normal,
                     &mut vec![],
-                    wait_notify,
                 ))
                 .await;
                 responses.push(response);

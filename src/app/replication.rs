@@ -3,16 +3,17 @@ use crate::app::{
     protocol::{RespDecoder, RespValue},
     AppContext,
 };
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use bytes::{Buf, Bytes};
 use futures::{SinkExt, StreamExt};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, MutexGuard, PoisonError,
 };
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, Notify};
 use tokio_util::codec::{Framed, FramedParts};
 use tracing::{debug, error, info, warn};
 
@@ -22,7 +23,7 @@ pub enum Role {
     Replica,
 }
 
-type ReplicaSender = mpsc::Sender<RespValue>;
+type ReplicaSender = mpsc::UnboundedSender<RespValue>;
 
 #[derive(Debug)]
 struct ReplicaInfo {
@@ -30,13 +31,21 @@ struct ReplicaInfo {
     acknowledged_offset: Arc<AtomicUsize>,
 }
 
+/// The connected replicas and the replication offset, changed together so the
+/// offset always matches what has been sent.
+#[derive(Debug, Default)]
+struct Replicas {
+    connected: Vec<ReplicaInfo>,
+    offset: usize,
+}
+
 #[derive(Debug)]
 pub struct ReplicationState {
     role: Role,
     master_replid: String,
-    master_repl_offset: AtomicUsize,
-    replicas: Mutex<Vec<ReplicaInfo>>,
-    pub(crate) wait_waiters: crate::app::wait::WaiterRegistry, // Using our BLPOP waiter for WAIT as well
+    replicas: Mutex<Replicas>,
+    /// Wakes WAIT commands whenever a replica acknowledges an offset.
+    acks_changed: Notify,
 }
 
 impl ReplicationState {
@@ -50,9 +59,8 @@ impl ReplicationState {
         Self {
             role,
             master_replid: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
-            master_repl_offset: AtomicUsize::new(0),
-            replicas: Mutex::new(Vec::new()),
-            wait_waiters: crate::app::wait::WaiterRegistry::new(),
+            replicas: Mutex::new(Replicas::default()),
+            acks_changed: Notify::new(),
         }
     }
 
@@ -63,11 +71,11 @@ impl ReplicationState {
         &self.master_replid
     }
     pub fn master_repl_offset(&self) -> usize {
-        self.master_repl_offset.load(Ordering::Relaxed)
+        self.replicas().offset
     }
 
-    pub async fn replica_count(&self) -> usize {
-        self.replicas.lock().await.len()
+    fn replicas(&self) -> MutexGuard<'_, Replicas> {
+        self.replicas.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn info_string(&self) -> String {
@@ -83,54 +91,81 @@ impl ReplicationState {
         )
     }
 
-    pub async fn add_replica(&self, tx: ReplicaSender) -> Arc<AtomicUsize> {
-        let mut replicas = self.replicas.lock().await;
-        let ack_offset = Arc::new(AtomicUsize::new(0));
-        replicas.push(ReplicaInfo {
-            sender: tx,
-            acknowledged_offset: Arc::clone(&ack_offset),
+    /// Registers a replica that receives everything sent from now on. Returns
+    /// the offset it has acknowledged, which its serving task keeps up to date.
+    pub fn add_replica(&self, sender: ReplicaSender) -> Arc<AtomicUsize> {
+        let acknowledged_offset = Arc::new(AtomicUsize::new(0));
+        self.replicas().connected.push(ReplicaInfo {
+            sender,
+            acknowledged_offset: Arc::clone(&acknowledged_offset),
         });
-        ack_offset
+        acknowledged_offset
     }
 
-    pub fn propagate(self: Arc<Self>, cmd: ParsedCommand) {
-        tokio::spawn(async move {
-            let resp_array = cmd.into_resp_array();
-            let bytes = resp_array.encode_to_bytes();
-            self.master_repl_offset
-                .fetch_add(bytes.len(), Ordering::Relaxed);
-
-            let replicas = self.replicas.lock().await;
-            for replica_info in replicas.iter() {
-                if let Err(e) = replica_info.sender.send(resp_array.clone()).await {
-                    error!("Failed to propagate command to replica: {}", e);
-                }
-            }
-            // After propagating, notify any waiting WAIT commands.
-            self.wait_waiters.notify_all();
-        });
+    /// Sends a write to every replica and advances the replication offset.
+    /// Replicas receive writes in the order of the calls; callers make that
+    /// the order the writes were applied in. Disconnected replicas are dropped.
+    pub fn propagate(&self, command: RespValue) {
+        let len = command.encode_to_bytes().len();
+        let mut replicas = self.replicas();
+        replicas.offset += len;
+        replicas
+            .connected
+            .retain(|replica| replica.sender.send(command.clone()).is_ok());
     }
 
-    pub async fn broadcast_getack(&self) {
+    /// Asks every replica to report the offset it has processed.
+    pub fn broadcast_getack(&self) {
         let getack_cmd = RespValue::Array(vec![
             RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
             RespValue::BulkString(Bytes::from_static(b"GETACK")),
             RespValue::BulkString(Bytes::from_static(b"*")),
         ]);
-        let replicas = self.replicas.lock().await;
-        for replica_info in replicas.iter() {
-            if let Err(e) = replica_info.sender.send(getack_cmd.clone()).await {
-                error!("Failed to send GETACK to replica: {}", e);
+        self.replicas()
+            .connected
+            .retain(|replica| replica.sender.send(getack_cmd.clone()).is_ok());
+    }
+
+    /// The number of replicas that have acknowledged at least `target_offset`.
+    pub fn count_acks(&self, target_offset: usize) -> usize {
+        self.replicas()
+            .connected
+            .iter()
+            .filter(|r| r.acknowledged_offset.load(Ordering::Acquire) >= target_offset)
+            .count()
+    }
+
+    /// Waits until `wanted` replicas have acknowledged `target_offset`, or until
+    /// `timeout` passes, and returns how many have.
+    pub async fn wait_for_acks(
+        &self,
+        target_offset: usize,
+        wanted: usize,
+        timeout: Duration,
+    ) -> usize {
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            // Register for the next ACK before counting, so one that arrives
+            // between the count and the wait still wakes this task.
+            let acked = self.acks_changed.notified();
+            tokio::pin!(acked);
+            acked.as_mut().enable();
+
+            let count = self.count_acks(target_offset);
+            if count >= wanted {
+                return count;
+            }
+            tokio::select! {
+                _ = &mut acked => {}
+                _ = &mut deadline => return self.count_acks(target_offset),
             }
         }
     }
 
-    pub async fn count_acks(&self, target_offset: usize) -> usize {
-        let replicas = self.replicas.lock().await;
-        replicas
-            .iter()
-            .filter(|r| r.acknowledged_offset.load(Ordering::Relaxed) >= target_offset)
-            .count()
+    fn record_ack(&self, acknowledged_offset: &AtomicUsize, offset: usize) {
+        acknowledged_offset.store(offset, Ordering::Release);
+        self.acks_changed.notify_waiters();
     }
 }
 
@@ -151,69 +186,64 @@ pub async fn start_replica_mode(master_addr: String, listening_port: u16, ctx: A
     }
 }
 
+/// Sends one handshake command and waits for the master's reply.
+async fn handshake_step(
+    framed: &mut Framed<TcpStream, RespDecoder>,
+    parts: &[&[u8]],
+) -> Result<RespValue> {
+    let command = parts
+        .iter()
+        .map(|part| RespValue::BulkString(Bytes::copy_from_slice(part)))
+        .collect();
+    framed.send(RespValue::Array(command)).await?;
+    Ok(framed
+        .next()
+        .await
+        .context("master closed the connection during the handshake")??)
+}
+
 async fn perform_handshake(
     stream: TcpStream,
     listening_port: u16,
     ctx: Arc<AppContext>,
 ) -> Result<()> {
     let mut framed = Framed::new(stream, RespDecoder);
+    let port = listening_port.to_string();
 
-    framed
-        .send(RespValue::Array(vec![RespValue::BulkString(
-            Bytes::from_static(b"PING"),
-        )]))
-        .await?;
-    let _ = framed.next().await.unwrap()?;
-
-    framed
-        .send(RespValue::Array(vec![
-            RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-            RespValue::BulkString(Bytes::from_static(b"listening-port")),
-            RespValue::BulkString(Bytes::from(listening_port.to_string())),
-        ]))
-        .await?;
-    let _ = framed.next().await.unwrap()?;
-
-    framed
-        .send(RespValue::Array(vec![
-            RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-            RespValue::BulkString(Bytes::from_static(b"capa")),
-            RespValue::BulkString(Bytes::from_static(b"psync2")),
-        ]))
-        .await?;
-    let _ = framed.next().await.unwrap()?;
-
-    framed
-        .send(RespValue::Array(vec![
-            RespValue::BulkString(Bytes::from_static(b"PSYNC")),
-            RespValue::BulkString(Bytes::from_static(b"?")),
-            RespValue::BulkString(Bytes::from_static(b"-1")),
-        ]))
-        .await?;
-    let _ = framed.next().await.unwrap()?;
+    handshake_step(&mut framed, &[b"PING"]).await?;
+    handshake_step(
+        &mut framed,
+        &[b"REPLCONF", b"listening-port", port.as_bytes()],
+    )
+    .await?;
+    handshake_step(&mut framed, &[b"REPLCONF", b"capa", b"psync2"]).await?;
+    handshake_step(&mut framed, &[b"PSYNC", b"?", b"-1"]).await?;
 
     info!("Handshake complete. Receiving RDB file from master.");
 
+    // The RDB file arrives as `$<len>\r\n` and `len` raw bytes with no trailing CRLF.
     let parts = framed.into_parts();
     let mut stream = parts.io;
     let mut read_buf = parts.read_buf;
 
-    let mut line_buffer = Vec::new();
-    loop {
+    let mut line = Vec::new();
+    while !line.ends_with(b"\r\n") {
         if read_buf.is_empty() && stream.read_buf(&mut read_buf).await? == 0 {
-            break;
+            bail!("master closed the connection before sending the RDB file");
         }
-        let byte = read_buf.get_u8();
-        line_buffer.push(byte);
-        if line_buffer.ends_with(b"\r\n") {
-            break;
-        }
+        line.push(read_buf.get_u8());
     }
-    let len_str = std::str::from_utf8(&line_buffer[1..line_buffer.len() - 2])?;
-    let rdb_len = len_str.parse::<usize>()?;
+    let rdb_len: usize = line
+        .strip_prefix(b"$")
+        .and_then(|l| l.strip_suffix(b"\r\n"))
+        .and_then(|l| std::str::from_utf8(l).ok())
+        .and_then(|l| l.parse().ok())
+        .context("invalid RDB length line from master")?;
 
     while read_buf.len() < rdb_len {
-        stream.read_buf(&mut read_buf).await?;
+        if stream.read_buf(&mut read_buf).await? == 0 {
+            bail!("master closed the connection while sending the RDB file");
+        }
     }
     read_buf.advance(rdb_len);
 
@@ -228,47 +258,35 @@ async fn perform_handshake(
         match framed.next().await {
             Some(Ok(value)) => {
                 debug!("Replica received value from master: {value:?}");
-                let raw_bytes = value.encode_to_bytes();
-                let parsed_command = ParsedCommand::from_resp(value)?;
-
-                let cmd = parsed_command.command();
-                let is_write = matches!(
-                    cmd,
-                    Command::Set
-                        | Command::LPush
-                        | Command::RPush
-                        | Command::LPop
-                        | Command::Incr
-                        | Command::XAdd
-                        | Command::ZAdd
-                        | Command::ZRem
-                        | Command::GeoAdd
-                );
-
-                if is_write {
-                    let response = crate::app::apply_command(&ctx, parsed_command.clone()).await;
-                    if let RespValue::Error(e) = response {
-                        warn!(
-                            "Replica failed to apply write command {:?}: {}",
-                            cmd,
-                            String::from_utf8_lossy(&e)
-                        );
+                let raw_len = value.encode_to_bytes().len();
+                match ParsedCommand::from_resp(value) {
+                    Ok(parsed_command) => {
+                        let cmd = parsed_command.command();
+                        if cmd.is_write() {
+                            let response = crate::app::apply_command(&ctx, parsed_command).await;
+                            if let RespValue::Error(e) = response {
+                                warn!(
+                                    "Replica failed to apply write command {:?}: {}",
+                                    cmd,
+                                    String::from_utf8_lossy(&e)
+                                );
+                            }
+                        } else if cmd == Command::ReplConf
+                            && parsed_command
+                                .arg(0)
+                                .is_some_and(|a| a.eq_ignore_ascii_case(b"getack"))
+                        {
+                            let ack_response = RespValue::Array(vec![
+                                RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
+                                RespValue::BulkString(Bytes::from_static(b"ACK")),
+                                RespValue::BulkString(Bytes::from(offset.to_string())),
+                            ]);
+                            framed.send(ack_response).await?;
+                        }
                     }
+                    Err(e) => warn!("Replica ignored a command from the master: {e}"),
                 }
-
-                if parsed_command.command() == Command::ReplConf
-                    && parsed_command
-                        .arg(0)
-                        .is_some_and(|a| a.eq_ignore_ascii_case(b"getack"))
-                {
-                    let ack_response = RespValue::Array(vec![
-                        RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-                        RespValue::BulkString(Bytes::from_static(b"ACK")),
-                        RespValue::BulkString(Bytes::from(offset.to_string())),
-                    ]);
-                    framed.send(ack_response).await?;
-                }
-                offset += raw_bytes.len();
+                offset += raw_len;
             }
             Some(Err(e)) => {
                 error!("Error receiving from master: {e}");
@@ -285,10 +303,10 @@ async fn perform_handshake(
 }
 
 pub async fn serve_replica(
-    mut rx: mpsc::Receiver<RespValue>,
+    mut rx: mpsc::UnboundedReceiver<RespValue>,
     mut framed: Framed<TcpStream, RespDecoder>,
-    ack_offset: Arc<AtomicUsize>,
-    wait_notify: Arc<Notify>,
+    acknowledged_offset: Arc<AtomicUsize>,
+    replication: Arc<ReplicationState>,
 ) {
     info!("New replica serving task started.");
     loop {
@@ -306,17 +324,15 @@ pub async fn serve_replica(
                             Ok(p) => p,
                             Err(e) => { warn!("Error parsing command from replica: {e}"); continue; },
                         };
-                        if parsed.command() == Command::ReplConf && parsed.arg(0).is_some_and(|a| a.eq_ignore_ascii_case(b"ack")) {
-                           if let Some(offset_bytes) = parsed.arg(1) {
-                               if let Ok(offset_str) = std::str::from_utf8(offset_bytes) {
-                                   if let Ok(offset) = offset_str.parse::<usize>() {
-                                       ack_offset.store(offset, Ordering::Relaxed);
-                                       wait_notify.notify_one();
-                                   }
-                               }
-                           }
-                        } else {
-                            warn!("Unexpected command from replica: {:?}", parsed.command());
+                        let is_ack = parsed.command() == Command::ReplConf
+                            && parsed.arg(0).is_some_and(|a| a.eq_ignore_ascii_case(b"ack"));
+                        let offset = parsed
+                            .arg(1)
+                            .and_then(|o| std::str::from_utf8(o).ok())
+                            .and_then(|o| o.parse::<usize>().ok());
+                        match (is_ack, offset) {
+                            (true, Some(offset)) => replication.record_ack(&acknowledged_offset, offset),
+                            _ => warn!("Unexpected command from replica: {:?}", parsed.command()),
                         }
                     }
                     Some(Err(e)) => { error!("Error reading from replica: {e}. Closing connection."); break; }
@@ -326,4 +342,134 @@ pub async fn serve_replica(
         }
     }
     info!("Replica serving task finished.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::store::DataType;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    fn master() -> Arc<ReplicationState> {
+        let config = <crate::config::Config as clap::Parser>::parse_from(["redis"]);
+        Arc::new(ReplicationState::new_from_config(&config))
+    }
+
+    fn set(key: &'static [u8]) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"SET")),
+            RespValue::BulkString(Bytes::from_static(key)),
+            RespValue::BulkString(Bytes::from_static(b"v")),
+        ])
+    }
+
+    #[test]
+    fn propagate_drops_disconnected_replicas() {
+        let replication = master();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        replication.add_replica(tx1);
+        replication.add_replica(tx2);
+        assert_eq!(replication.count_acks(0), 2);
+
+        drop(rx2);
+        replication.propagate(set(b"a"));
+        assert_eq!(replication.count_acks(0), 1);
+        assert_eq!(rx1.try_recv().ok(), Some(set(b"a")));
+        assert_eq!(
+            replication.master_repl_offset(),
+            set(b"a").encode_to_bytes().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_acks_wakes_when_a_replica_acknowledges() {
+        let replication = master();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let acked = replication.add_replica(tx);
+        replication.propagate(set(b"a"));
+        let target = replication.master_repl_offset();
+
+        let acker = {
+            let replication = Arc::clone(&replication);
+            tokio::spawn(async move { replication.record_ack(&acked, target) })
+        };
+        // The timeout only bounds a failure; a correct wait returns on the ACK.
+        let count = replication
+            .wait_for_acks(target, 1, Duration::from_secs(60))
+            .await;
+        acker.await.expect("acker");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_acks_returns_the_count_at_the_timeout() {
+        let replication = master();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        replication.add_replica(tx);
+        replication.propagate(set(b"a"));
+        let target = replication.master_repl_offset();
+        assert_eq!(
+            replication.wait_for_acks(target, 1, Duration::ZERO).await,
+            0
+        );
+    }
+
+    /// Serves the replica handshake, then writes `after_handshake` and closes.
+    async fn fake_master(after_handshake: Vec<u8>) -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut framed = Framed::new(stream, RespDecoder);
+            for reply in [
+                "PONG",
+                "OK",
+                "OK",
+                "FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0",
+            ] {
+                framed.next().await.expect("request").expect("decode");
+                framed
+                    .send(RespValue::SimpleString(Bytes::from(reply)))
+                    .await
+                    .expect("reply");
+            }
+            let mut stream = framed.into_inner();
+            stream.write_all(&after_handshake).await.expect("write");
+        });
+        TcpStream::connect(addr).await.expect("connect")
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_when_the_master_disconnects_mid_rdb() {
+        let stream = fake_master(b"$100\r\nREDIS0011".to_vec()).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            perform_handshake(stream, 6380, crate::app::test_context()),
+        )
+        .await
+        .expect("handshake returns instead of spinning");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn replica_skips_unknown_commands_and_applies_later_writes() {
+        let mut stream_bytes = crate::app::rdb::empty_rdb_bytes();
+        stream_bytes.extend_from_slice(b"*1\r\n$7\r\nUNKNOWN\r\n");
+        stream_bytes.extend_from_slice(&set(b"k").encode_to_bytes());
+        let stream = fake_master(stream_bytes).await;
+
+        let ctx = crate::app::test_context();
+        perform_handshake(stream, 6380, Arc::clone(&ctx))
+            .await
+            .expect("replication ends cleanly when the master closes");
+        let value = ctx.store.with_keyspace(|ks| {
+            ks.get_as(&Bytes::from_static(b"k"), DataType::as_string)
+                .ok()
+                .flatten()
+                .cloned()
+        });
+        assert_eq!(value, Some(Bytes::from_static(b"v")));
+    }
 }

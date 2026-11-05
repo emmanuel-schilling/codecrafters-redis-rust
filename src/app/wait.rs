@@ -5,14 +5,11 @@ use tokio::sync::Notify;
 use tokio::time::{self, Duration};
 use tracing::debug;
 
-/// A registry for tasks waiting for list notifications (for BLPOP).
-/// It also serves as a general notification mechanism for the WAIT command.
+/// A registry of tasks blocked on keys (BLPOP and XREAD BLOCK).
 #[derive(Debug, Default)]
 pub struct WaiterRegistry {
     /// Maps a list key to a queue of `Notify` objects (for BLPOP).
     waiters: Mutex<HashMap<Bytes, VecDeque<Arc<Notify>>>>,
-    /// `Notify` objects for tasks waiting on `WAIT` conditions.
-    wait_command_notifiers: Mutex<VecDeque<Arc<Notify>>>,
 }
 
 /// Locks `mutex`, recovering the data if another task panicked while holding it.
@@ -69,20 +66,6 @@ impl WaiterRegistry {
                     waiters.remove(key);
                 }
             }
-        }
-    }
-
-    /// Registers a `Notify` object for a `WAIT` command.
-    pub async fn register_wait_notifier(&self, notify: Arc<Notify>) {
-        lock(&self.wait_command_notifiers).push_back(notify);
-    }
-
-    /// Notifies all tasks waiting on a `WAIT` command (e.g., after a propagation).
-    pub fn notify_all(&self) {
-        // Drain and notify all current waiters.
-        // New WAIT commands will register their own notify objects.
-        for notify in lock(&self.wait_command_notifiers).drain(..) {
-            notify.notify_one();
         }
     }
 }
