@@ -33,8 +33,6 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 strum = "=0.28.0"
 strum_macros = "=0.28.0"
 
-# Concurrent keyspace map
-dashmap = "=6.2.1"
 
 # Total ordering for sorted-set scores
 ordered-float = "=5.5.1"

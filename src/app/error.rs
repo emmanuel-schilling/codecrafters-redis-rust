@@ -1,8 +1,5 @@
 use thiserror::Error;
 
-/// A constant for the WRONGTYPE error, for convenience.
-pub const WRONGTYPE_ERROR: AppError = AppError::WrongType;
-
 /// Represents errors that can occur within the application logic.
 #[derive(Error, Debug)]
 pub enum AppError {

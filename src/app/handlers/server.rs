@@ -24,8 +24,8 @@ fn handle_type(parsed: ParsedCommand, store: &Store) -> RespValue {
             b"ERR wrong number of arguments for 'type' command",
         ));
     };
-    let type_name = store.get_type(key);
-    RespValue::SimpleString(Bytes::from(type_name))
+    let type_name = store.with_keyspace(|ks| ks.type_name(key));
+    RespValue::SimpleString(Bytes::from_static(type_name.as_bytes()))
 }
 
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
@@ -74,6 +74,6 @@ fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
         return RespValue::Array(vec![]);
     }
 
-    let keys = store.get_all_keys();
+    let keys = store.with_keyspace(|ks| ks.keys());
     RespValue::Array(keys.into_iter().map(RespValue::BulkString).collect())
 }

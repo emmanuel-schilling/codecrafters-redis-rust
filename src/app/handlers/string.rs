@@ -1,7 +1,7 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     protocol::RespValue,
-    store::{DataType, Store, StoreValue},
+    store::{DataType, Store},
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -46,12 +46,7 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
     }
 
     let expires_at = expiry.and_then(|d| Instant::now().checked_add(d));
-    let store_value = StoreValue {
-        data: DataType::String(value.clone()),
-        expires_at,
-    };
-
-    store.db().insert(key.clone(), store_value);
+    store.with_keyspace(|ks| ks.set(key.clone(), DataType::String(value.clone()), expires_at));
     RespValue::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -62,23 +57,11 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
         ));
     };
 
-    match store.db().get(key) {
-        Some(entry) => {
-            if store.is_expired(&entry) {
-                drop(entry);
-                store.db().remove(key);
-                RespValue::NullBulkString
-            } else {
-                match &entry.data {
-                    DataType::String(s) => RespValue::BulkString(s.clone()),
-                    _ => RespValue::Error(Bytes::from_static(
-                        b"WRONGTYPE Operation against a key holding the wrong kind of value",
-                    )),
-                }
-            }
-        }
-        None => RespValue::NullBulkString,
-    }
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_string) {
+        Ok(Some(value)) => RespValue::BulkString(value.clone()),
+        Ok(None) => RespValue::NullBulkString,
+        Err(e) => e.into(),
+    })
 }
 
 fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
@@ -88,31 +71,69 @@ fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
         ));
     };
 
-    let mut entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
-        data: DataType::String(Bytes::from_static(b"0")),
-        expires_at: None,
-    });
+    store.with_keyspace(|ks| {
+        let value = match ks.get_or_create_as(key, DataType::as_string, || {
+            DataType::String(Bytes::from_static(b"0"))
+        }) {
+            Ok(value) => value,
+            Err(e) => return e.into(),
+        };
+        let Some(new_val) = std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|n| n.checked_add(1))
+        else {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ));
+        };
+        *value = Bytes::from(new_val.to_string());
+        RespValue::Integer(new_val)
+    })
+}
 
-    match &mut entry.value_mut().data {
-        DataType::String(bytes) => {
-            let current_val = match std::str::from_utf8(bytes)
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-            {
-                Some(v) => v,
-                None => {
-                    return RespValue::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ))
-                }
-            };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            let new_val = current_val + 1;
-            *bytes = Bytes::from(new_val.to_string());
-            RespValue::Integer(new_val)
-        }
-        _ => RespValue::Error(Bytes::from_static(
-            b"WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
+    fn run(parts: &[&str], store: &Arc<Store>) -> RespValue {
+        let command = ParsedCommand::from_resp(RespValue::Array(
+            parts
+                .iter()
+                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect(),
+        ))
+        .expect("valid command");
+        handle(command, store)
+    }
+
+    #[test]
+    fn incr_rejects_overflow_and_keeps_the_value() {
+        let store = Arc::new(Store::new());
+        run(&["SET", "n", &i64::MAX.to_string()], &store);
+        assert_eq!(
+            run(&["INCR", "n"], &store),
+            RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range"
+            ))
+        );
+        assert_eq!(
+            run(&["GET", "n"], &store),
+            RespValue::BulkString(Bytes::from(i64::MAX.to_string()))
+        );
+    }
+
+    #[test]
+    fn incr_starts_an_expired_key_from_zero() {
+        let store = Arc::new(Store::new());
+        let past = Instant::now().checked_sub(Duration::from_secs(1));
+        store.with_keyspace(|ks| {
+            ks.set(
+                Bytes::from_static(b"n"),
+                DataType::String(Bytes::from_static(b"41")),
+                past,
+            )
+        });
+        assert_eq!(run(&["INCR", "n"], &store), RespValue::Integer(1));
     }
 }

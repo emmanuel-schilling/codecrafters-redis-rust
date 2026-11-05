@@ -1,9 +1,10 @@
 use crate::app::command::Command;
 use crate::app::{
     command::ParsedCommand,
+    error::AppError,
     protocol::RespValue,
-    store::{DataType, Store, StoreValue},
-    stream::{Stream, XReadResult},
+    store::{DataType, Store},
+    stream::{Stream, StreamEntry, XReadResult},
     wait::WaiterRegistry,
 };
 use bytes::Bytes;
@@ -53,22 +54,16 @@ fn handle_xadd(
         .map(|[field, value]| (field.clone(), value.clone()))
         .collect();
 
-    let mut entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
-        data: DataType::Stream(Stream::new()),
-        expires_at: None,
+    let added = store.with_keyspace(|ks| {
+        ks.get_or_create_as(key, DataType::as_stream, || DataType::Stream(Stream::new()))?
+            .add(id_spec, fields)
     });
-
-    match &mut entry.value_mut().data {
-        DataType::Stream(stream) => match stream.add(id_spec, fields) {
-            Ok(id) => {
-                waiters.notify_one(key);
-                RespValue::BulkString(Bytes::from(id.to_string()))
-            }
-            Err(e) => RespValue::Error(Bytes::from(e.to_string())),
-        },
-        _ => RespValue::Error(Bytes::from_static(
-            b"WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
+    match added {
+        Ok(id) => {
+            waiters.notify_one(key);
+            RespValue::BulkString(Bytes::from(id.to_string()))
+        }
+        Err(e) => e.into(),
     }
 }
 
@@ -91,34 +86,14 @@ fn handle_xrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         ));
     };
 
-    match store.db().get(key) {
-        Some(entry) if !store.is_expired(&entry) => match &entry.data {
-            DataType::Stream(stream) => match stream.range(start_spec, end_spec) {
-                Ok(entries) => {
-                    let result_array = entries
-                        .into_iter()
-                        .map(|(id, fields)| {
-                            let mut field_array = Vec::with_capacity(fields.len() * 2);
-                            for (field, value) in fields {
-                                field_array.push(RespValue::BulkString(field));
-                                field_array.push(RespValue::BulkString(value));
-                            }
-                            RespValue::Array(vec![
-                                RespValue::BulkString(Bytes::from(id.to_string())),
-                                RespValue::Array(field_array),
-                            ])
-                        })
-                        .collect();
-                    RespValue::Array(result_array)
-                }
-                Err(e) => RespValue::Error(Bytes::from(e.to_string())),
-            },
-            _ => RespValue::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_stream) {
+        Ok(Some(stream)) => match stream.range(start_spec, end_spec) {
+            Ok(entries) => format_entries(entries),
+            Err(e) => e.into(),
         },
-        _ => RespValue::Array(vec![]),
-    }
+        Ok(None) => RespValue::Array(vec![]),
+        Err(e) => e.into(),
+    })
 }
 
 async fn handle_xread(
@@ -174,63 +149,47 @@ async fn handle_xread(
     let keys = &args[..num_keys];
     let id_specs_bytes = &args[num_keys..];
 
-    let resolved_ids: Vec<String> = id_specs_bytes
-        .iter()
-        .zip(keys.iter())
-        .map(|(id_bytes, key)| {
-            if &id_bytes[..] == b"$" {
-                match store.db().get(key) {
-                    Some(entry) if !store.is_expired(&entry) => {
-                        if let DataType::Stream(s) = &entry.data {
-                            s.last_id()
-                                .map(|id| id.to_string())
-                                .unwrap_or_else(|| "0-0".to_string())
-                        } else {
-                            "0-0".to_string()
+    // Resolve `$` to each stream's current last ID before reading or blocking.
+    let resolved_ids: Vec<String> = store.with_keyspace(|ks| {
+        id_specs_bytes
+            .iter()
+            .zip(keys.iter())
+            .map(|(id_bytes, key)| {
+                if &id_bytes[..] == b"$" {
+                    match ks.get_as(key, DataType::as_stream) {
+                        Ok(Some(stream)) => stream
+                            .last_id()
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "0-0".to_string()),
+                        _ => "0-0".to_string(),
+                    }
+                } else {
+                    String::from_utf8_lossy(id_bytes).to_string()
+                }
+            })
+            .collect()
+    });
+
+    let read = || {
+        store.with_keyspace(|ks| {
+            let mut results: XReadResult = Vec::new();
+            for (key, id_spec) in keys.iter().zip(&resolved_ids) {
+                if let Some(stream) = ks.get_as(key, DataType::as_stream)? {
+                    if let Ok(entries) = stream.read_from(id_spec) {
+                        if !entries.is_empty() {
+                            results.push((key.clone(), entries));
                         }
                     }
-                    _ => "0-0".to_string(),
                 }
-            } else {
-                String::from_utf8_lossy(id_bytes).to_string()
             }
+            Ok::<_, AppError>((!results.is_empty()).then_some(results))
         })
-        .collect();
-
-    let keys_and_ids: Vec<(&Bytes, &str)> = keys
-        .iter()
-        .zip(resolved_ids.iter())
-        .map(|(k, id)| (k, id.as_str()))
-        .collect();
-
-    let perform_read = |store: &Store, keys_and_ids: &[(&Bytes, &str)]| {
-        let mut results = Vec::new();
-        for (key, id_spec) in keys_and_ids {
-            let stream_data = match store.db().get(*key) {
-                Some(entry) if !store.is_expired(&entry) => match &entry.data {
-                    DataType::Stream(stream) => match stream.read_from(id_spec) {
-                        Ok(entries) if !entries.is_empty() => Some(((*key).clone(), entries)),
-                        _ => None,
-                    },
-                    _ => return Err(crate::app::error::WRONGTYPE_ERROR),
-                },
-                _ => None,
-            };
-            if let Some(data) = stream_data {
-                results.push(data);
-            }
-        }
-        if results.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(results))
-        }
     };
 
-    if let Ok(Some(results)) = perform_read(store, &keys_and_ids) {
-        return format_xread_response(results);
-    } else if let Err(e) = perform_read(store, &keys_and_ids) {
-        return RespValue::Error(Bytes::from(e.to_string()));
+    match read() {
+        Ok(Some(results)) => return format_xread_response(results),
+        Ok(None) => {}
+        Err(e) => return e.into(),
     }
 
     if block_timeout.is_none()
@@ -243,38 +202,43 @@ async fn handle_xread(
 
     waiters.wait_for_any(keys, block_timeout).await;
 
-    match perform_read(store, &keys_and_ids) {
+    match read() {
         Ok(Some(results)) => format_xread_response(results),
         Ok(None) => RespValue::NullArray,
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+        Err(e) => e.into(),
     }
 }
 
+/// Formats stream entries as XRANGE replies them: `[id, [field, value, ...]]` each.
+fn format_entries(entries: Vec<StreamEntry>) -> RespValue {
+    RespValue::Array(
+        entries
+            .into_iter()
+            .map(|(id, fields)| {
+                let field_array = fields
+                    .into_iter()
+                    .flat_map(|(field, value)| {
+                        [RespValue::BulkString(field), RespValue::BulkString(value)]
+                    })
+                    .collect();
+                RespValue::Array(vec![
+                    RespValue::BulkString(Bytes::from(id.to_string())),
+                    RespValue::Array(field_array),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn format_xread_response(results: XReadResult) -> RespValue {
-    let result_array = results
-        .into_iter()
-        .map(|(key, entries)| {
-            let entry_array = entries
-                .into_iter()
-                .map(|(id, fields)| {
-                    let mut field_array = Vec::with_capacity(fields.len() * 2);
-                    for (field, value) in fields {
-                        field_array.push(RespValue::BulkString(field));
-                        field_array.push(RespValue::BulkString(value));
-                    }
-                    RespValue::Array(vec![
-                        RespValue::BulkString(Bytes::from(id.to_string())),
-                        RespValue::Array(field_array),
-                    ])
-                })
-                .collect();
-            RespValue::Array(vec![
-                RespValue::BulkString(key),
-                RespValue::Array(entry_array),
-            ])
-        })
-        .collect();
-    RespValue::Array(result_array)
+    RespValue::Array(
+        results
+            .into_iter()
+            .map(|(key, entries)| {
+                RespValue::Array(vec![RespValue::BulkString(key), format_entries(entries)])
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

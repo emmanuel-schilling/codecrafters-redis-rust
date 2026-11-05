@@ -31,6 +31,13 @@ impl RespValue {
     }
 }
 
+impl From<AppError> for RespValue {
+    /// Turns an error into the error reply sent to the client.
+    fn from(error: AppError) -> Self {
+        RespValue::Error(Bytes::from(error.to_string()))
+    }
+}
+
 //--- Decoder (Parser) ---
 
 /// Longest bulk string accepted: Redis's default `proto-max-bulk-len` (512 MiB).

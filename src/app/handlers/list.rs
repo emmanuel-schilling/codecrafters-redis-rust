@@ -1,8 +1,9 @@
 use crate::app::command::Command;
 use crate::app::{
     command::ParsedCommand,
+    error::AppError,
     protocol::RespValue,
-    store::{DataType, Store, StoreValue},
+    store::{resolve_range, DataType, Store},
     wait::WaiterRegistry,
 };
 use bytes::Bytes;
@@ -40,29 +41,25 @@ fn handle_push(
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     }
 
-    let mut entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
-        data: DataType::List(VecDeque::new()),
-        expires_at: None,
+    let pushed = store.with_keyspace(|ks| {
+        let list =
+            ks.get_or_create_as(key, DataType::as_list, || DataType::List(VecDeque::new()))?;
+        for value in values {
+            if left {
+                list.push_front(value.clone());
+            } else {
+                list.push_back(value.clone());
+            }
+        }
+        Ok::<_, AppError>(list.len())
     });
 
-    match &mut entry.value_mut().data {
-        DataType::List(list) => {
-            for value in values {
-                if left {
-                    list.push_front(value.clone());
-                } else {
-                    list.push_back(value.clone());
-                }
-            }
-            let len = list.len();
-            if len > 0 {
-                waiters.notify_one(key);
-            }
+    match pushed {
+        Ok(len) => {
+            waiters.notify_one(key);
             RespValue::Integer(len as i64)
         }
-        _ => RespValue::Error(Bytes::from_static(
-            b"WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
+        Err(e) => e.into(),
     }
 }
 
@@ -76,40 +73,20 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
 
-    let mut entry = match store.db().get_mut(key) {
-        Some(entry) => entry,
-        None => return RespValue::NullBulkString,
-    };
-
-    if store.is_expired(&entry) {
-        drop(entry);
-        store.db().remove(key);
-        return RespValue::NullBulkString;
-    }
-
-    match &mut entry.value_mut().data {
-        DataType::List(list) => {
-            if list.is_empty() {
-                return RespValue::NullBulkString;
-            }
-            let mut popped = Vec::with_capacity(count);
-            for _ in 0..count {
-                if let Some(val) = list.pop_front() {
-                    popped.push(val);
-                } else {
-                    break;
-                }
-            }
-            if popped.len() == 1 && count == 1 {
-                RespValue::BulkString(popped.into_iter().next().unwrap())
-            } else {
-                RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect())
-            }
+    store.with_keyspace(|ks| {
+        let list = match ks.get_as(key, DataType::as_list) {
+            Ok(Some(list)) => list,
+            Ok(None) => return RespValue::NullBulkString,
+            Err(e) => return e.into(),
+        };
+        let mut popped: Vec<Bytes> = list.drain(..count.min(list.len())).collect();
+        ks.remove_if_empty(key);
+        if count == 1 && popped.len() == 1 {
+            RespValue::BulkString(popped.swap_remove(0))
+        } else {
+            RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect())
         }
-        _ => RespValue::Error(Bytes::from_static(
-            b"WRONGTYPE Operation against a key holding the wrong kind of value",
-        )),
-    }
+    })
 }
 
 async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> RespValue {
@@ -133,29 +110,22 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     };
 
-    let try_pop = |store: &Store, keys: &[Bytes]| {
-        for key in keys {
-            let mut entry = match store.db().get_mut(key) {
-                Some(entry) => entry,
-                None => continue,
-            };
-
-            if store.is_expired(&entry) {
-                drop(entry);
-                store.db().remove(key);
-                continue;
-            }
-
-            if let DataType::List(list) = &mut entry.value_mut().data {
-                if let Some(value) = list.pop_front() {
-                    return Some((key.clone(), value));
+    // Pops from the first key holding a non-empty list; keys of other types are skipped.
+    let try_pop = || {
+        store.with_keyspace(|ks| {
+            for key in keys {
+                if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
+                    if let Some(value) = list.pop_front() {
+                        ks.remove_if_empty(key);
+                        return Some((key.clone(), value));
+                    }
                 }
             }
-        }
-        None
+            None
+        })
     };
 
-    if let Some((key, value)) = try_pop(store, keys) {
+    if let Some((key, value)) = try_pop() {
         return RespValue::Array(vec![
             RespValue::BulkString(key),
             RespValue::BulkString(value),
@@ -170,7 +140,7 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
 
     waiters.wait_for_any(keys, timeout).await;
 
-    if let Some((key, value)) = try_pop(store, keys) {
+    if let Some((key, value)) = try_pop() {
         RespValue::Array(vec![
             RespValue::BulkString(key),
             RespValue::BulkString(value),
@@ -184,15 +154,11 @@ fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
-    match store.db().get(key) {
-        Some(entry) if !store.is_expired(&entry) => match &entry.data {
-            DataType::List(list) => RespValue::Integer(list.len() as i64),
-            _ => RespValue::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
-        },
-        _ => RespValue::Integer(0),
-    }
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_list) {
+        Ok(Some(list)) => RespValue::Integer(list.len() as i64),
+        Ok(None) => RespValue::Integer(0),
+        Err(e) => e.into(),
+    })
 }
 
 fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
@@ -225,30 +191,105 @@ fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
         }
     };
 
-    match store.db().get(key) {
-        Some(entry) if !store.is_expired(&entry) => match &entry.data {
-            DataType::List(list) => {
-                let len = list.len() as i64;
-                let start_idx = store.normalize_index(start, len);
-                let stop_idx = store.normalize_index(stop, len);
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_list) {
+        Ok(Some(list)) => {
+            let items = resolve_range(start, stop, list.len())
+                .map(|(first, last)| {
+                    list.range(first..=last)
+                        .cloned()
+                        .map(RespValue::BulkString)
+                        .collect()
+                })
+                .unwrap_or_default();
+            RespValue::Array(items)
+        }
+        Ok(None) => RespValue::Array(vec![]),
+        Err(e) => e.into(),
+    })
+}
 
-                if start_idx > stop_idx {
-                    return RespValue::Array(vec![]);
-                }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-                let items = list
-                    .iter()
-                    .skip(start_idx)
-                    .take(stop_idx - start_idx + 1)
-                    .cloned()
-                    .map(RespValue::BulkString)
-                    .collect();
-                RespValue::Array(items)
-            }
-            _ => RespValue::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
-        },
-        _ => RespValue::Array(vec![]),
+    async fn run(parts: &[&str], store: &Arc<Store>) -> RespValue {
+        let command = ParsedCommand::from_resp(RespValue::Array(
+            parts
+                .iter()
+                .map(|p| RespValue::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect(),
+        ))
+        .expect("valid command");
+        handle(command, store, &Arc::new(WaiterRegistry::new())).await
+    }
+
+    fn bulks(items: &[&str]) -> RespValue {
+        RespValue::Array(
+            items
+                .iter()
+                .map(|s| RespValue::BulkString(Bytes::copy_from_slice(s.as_bytes())))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lrange_resolves_negative_and_out_of_range_indexes() {
+        let store = Arc::new(Store::new());
+        run(&["RPUSH", "l", "a", "b", "c"], &store).await;
+        let cases: [(&str, &str, &[&str]); 7] = [
+            ("0", "-1", &["a", "b", "c"]),
+            ("-2", "-1", &["b", "c"]),
+            ("1", "100", &["b", "c"]),
+            ("-100", "0", &["a"]),
+            ("0", "-100", &[]),
+            ("3", "5", &[]),
+            ("2", "1", &[]),
+        ];
+        for (start, stop, expected) in cases {
+            assert_eq!(
+                run(&["LRANGE", "l", start, stop], &store).await,
+                bulks(expected),
+                "LRANGE l {start} {stop}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn popping_the_last_element_deletes_the_list() {
+        let store = Arc::new(Store::new());
+        run(&["RPUSH", "l", "a", "b"], &store).await;
+        assert_eq!(run(&["LPOP", "l", "2"], &store).await, bulks(&["a", "b"]));
+        assert_eq!(
+            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"l"))),
+            "none"
+        );
+
+        run(&["RPUSH", "m", "x"], &store).await;
+        assert_eq!(run(&["BLPOP", "m", "0"], &store).await, bulks(&["m", "x"]));
+        assert_eq!(
+            store.with_keyspace(|ks| ks.type_name(&Bytes::from_static(b"m"))),
+            "none"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_replaces_an_expired_key_of_another_type() {
+        let store = Arc::new(Store::new());
+        let past = std::time::Instant::now().checked_sub(Duration::from_secs(1));
+        store.with_keyspace(|ks| {
+            ks.set(
+                Bytes::from_static(b"k"),
+                DataType::String(Bytes::from_static(b"old")),
+                past,
+            )
+        });
+        assert_eq!(
+            run(&["RPUSH", "k", "x"], &store).await,
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(&["LRANGE", "k", "0", "-1"], &store).await,
+            bulks(&["x"])
+        );
     }
 }

@@ -1,13 +1,12 @@
 use crate::app::{
     command::{Command, ParsedCommand},
-    error::AppError,
     geo,
     protocol::RespValue,
     sorted_set::SortedSet,
-    store::{DataType, Store, StoreValue},
+    store::{DataType, Store},
 };
 use bytes::Bytes;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     match parsed.command() {
@@ -16,36 +15,6 @@ pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         Command::GeoDist => handle_geodist(parsed, store),
         Command::GeoSearch => handle_geosearch(parsed, store),
         _ => RespValue::Error(Bytes::from_static(b"ERR unknown geo command")),
-    }
-}
-
-// Helper for ZADD logic used by GEOADD
-fn internal_zadd(store: &Store, key: Bytes, score: f64, member: Bytes) -> Result<usize, AppError> {
-    let entry = store.db().entry(key).or_insert_with(|| StoreValue {
-        data: DataType::SortedSet(RwLock::new(SortedSet::new())),
-        expires_at: None,
-    });
-
-    match &entry.value().data {
-        DataType::SortedSet(zset_lock) => {
-            let mut zset = zset_lock.write().unwrap();
-            Ok(zset.add(score, member))
-        }
-        _ => Err(crate::app::error::WRONGTYPE_ERROR),
-    }
-}
-
-// Helper for ZSCORE logic used by GEOPOS and GEODIST
-fn internal_zscore(store: &Store, key: &Bytes, member: &Bytes) -> Result<Option<f64>, AppError> {
-    match store.db().get(key) {
-        Some(entry) if !store.is_expired(&entry) => match &entry.data {
-            DataType::SortedSet(zset_lock) => {
-                let zset = zset_lock.read().unwrap();
-                Ok(zset.score_of(member))
-            }
-            _ => Err(crate::app::error::WRONGTYPE_ERROR),
-        },
-        _ => Ok(None),
     }
 }
 
@@ -85,10 +54,14 @@ fn handle_geoadd(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     }
 
     let score = geo::encode(latitude, longitude) as f64;
-    match internal_zadd(store, key.clone(), score, member.clone()) {
-        Ok(count) => RespValue::Integer(count as i64),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
-    }
+    store.with_keyspace(|ks| {
+        match ks.get_or_create_as(key, DataType::as_sorted_set, || {
+            DataType::SortedSet(SortedSet::new())
+        }) {
+            Ok(zset) => RespValue::Integer(zset.add(score, member.clone()) as i64),
+            Err(e) => e.into(),
+        }
+    })
 }
 
 fn handle_geopos(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
@@ -99,21 +72,26 @@ fn handle_geopos(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     };
     let members = parsed.args_from(1);
 
-    let mut results = Vec::with_capacity(members.len());
-    for member in members {
-        match internal_zscore(store, key, member) {
-            Ok(Some(score)) => {
-                let coords = geo::decode(score as u64);
-                results.push(RespValue::Array(vec![
-                    RespValue::BulkString(Bytes::from(coords.longitude.to_string())),
-                    RespValue::BulkString(Bytes::from(coords.latitude.to_string())),
-                ]));
-            }
-            Ok(None) => results.push(RespValue::NullArray),
-            Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
-        }
-    }
-    RespValue::Array(results)
+    store.with_keyspace(|ks| {
+        let zset = match ks.get_as(key, DataType::as_sorted_set) {
+            Ok(zset) => zset.map(|zset| &*zset),
+            Err(e) => return e.into(),
+        };
+        let positions = members
+            .iter()
+            .map(|member| match zset.and_then(|zset| zset.score_of(member)) {
+                Some(score) => {
+                    let coords = geo::decode(score as u64);
+                    RespValue::Array(vec![
+                        RespValue::BulkString(Bytes::from(coords.longitude.to_string())),
+                        RespValue::BulkString(Bytes::from(coords.latitude.to_string())),
+                    ])
+                }
+                None => RespValue::NullArray,
+            })
+            .collect();
+        RespValue::Array(positions)
+    })
 }
 
 fn handle_geodist(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
@@ -124,23 +102,22 @@ fn handle_geodist(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         ));
     };
 
-    let pos1 = match internal_zscore(store, key, member1) {
-        Ok(Some(score)) => Some(geo::decode(score as u64)),
-        Ok(None) => None,
-        Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
-    };
-    let pos2 = match internal_zscore(store, key, member2) {
-        Ok(Some(score)) => Some(geo::decode(score as u64)),
-        Ok(None) => None,
-        Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
-    };
-
-    match (pos1, pos2) {
-        (Some(c1), Some(c2)) => {
-            RespValue::BulkString(Bytes::from(format!("{:.4}", geo::distance(c1, c2))))
+    store.with_keyspace(|ks| {
+        let zset = match ks.get_as(key, DataType::as_sorted_set) {
+            Ok(zset) => zset.map(|zset| &*zset),
+            Err(e) => return e.into(),
+        };
+        let position = |member| {
+            zset.and_then(|zset| zset.score_of(member))
+                .map(|score| geo::decode(score as u64))
+        };
+        match (position(member1), position(member2)) {
+            (Some(c1), Some(c2)) => {
+                RespValue::BulkString(Bytes::from(format!("{:.4}", geo::distance(c1, c2))))
+            }
+            _ => RespValue::NullBulkString,
         }
-        _ => RespValue::NullBulkString,
-    }
+    })
 }
 
 fn handle_geosearch(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
@@ -206,26 +183,21 @@ fn handle_geosearch(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         latitude: center_lat,
     };
 
-    match store.db().get(key) {
-        Some(entry) if !store.is_expired(&entry) => match &entry.data {
-            DataType::SortedSet(zset_lock) => {
-                let zset = zset_lock.read().unwrap();
-                let mut results = Vec::new();
-                for member in zset.get_all_members() {
-                    if let Some(score) = zset.score_of(&member) {
-                        let member_coords = geo::decode(score.round() as u64);
-                        let distance = geo::distance(center_coords, member_coords);
-                        if distance <= radius_meters {
-                            results.push(RespValue::BulkString(member));
-                        }
+    store.with_keyspace(|ks| match ks.get_as(key, DataType::as_sorted_set) {
+        Ok(Some(zset)) => {
+            let mut results = Vec::new();
+            for member in zset.get_all_members() {
+                if let Some(score) = zset.score_of(&member) {
+                    let member_coords = geo::decode(score.round() as u64);
+                    let distance = geo::distance(center_coords, member_coords);
+                    if distance <= radius_meters {
+                        results.push(RespValue::BulkString(member));
                     }
                 }
-                RespValue::Array(results)
             }
-            _ => RespValue::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
-        },
-        _ => RespValue::Array(vec![]),
-    }
+            RespValue::Array(results)
+        }
+        Ok(None) => RespValue::Array(vec![]),
+        Err(e) => e.into(),
+    })
 }

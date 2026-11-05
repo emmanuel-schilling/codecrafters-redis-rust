@@ -1,18 +1,18 @@
 use crate::app::protocol::RespValue;
 use bytes::Bytes;
-use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use tokio::sync::mpsc;
 use tracing::debug;
 
 type ClientId = u64;
-type SubscriberMap = DashMap<ClientId, mpsc::Sender<RespValue>>;
+type SubscriberMap = HashMap<ClientId, mpsc::Sender<RespValue>>;
 
 #[derive(Debug, Default)]
 pub struct PubSubHub {
     /// Maps a channel name to a map of subscribers.
     /// The inner map maps a unique client ID to their sender channel.
-    channels: DashMap<Bytes, SubscriberMap>,
+    channels: Mutex<HashMap<Bytes, SubscriberMap>>,
 }
 
 impl PubSubHub {
@@ -20,9 +20,14 @@ impl PubSubHub {
         Self::default()
     }
 
+    /// Locks the channel map, recovering it if another task panicked while holding it.
+    fn channels(&self) -> MutexGuard<'_, HashMap<Bytes, SubscriberMap>> {
+        self.channels.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Subscribes a client to a channel.
     pub fn subscribe(&self, channel: Bytes, client_id: ClientId, sender: mpsc::Sender<RespValue>) {
-        self.channels
+        self.channels()
             .entry(channel)
             .or_default()
             .insert(client_id, sender);
@@ -30,12 +35,12 @@ impl PubSubHub {
 
     /// Unsubscribes a client from a specific channel.
     pub fn unsubscribe(&self, channel: &Bytes, client_id: ClientId) {
-        if let Some(channel_subs) = self.channels.get_mut(channel) {
+        let mut channels = self.channels();
+        if let Some(channel_subs) = channels.get_mut(channel) {
             channel_subs.remove(&client_id);
             if channel_subs.is_empty() {
                 // Clean up the channel entry if no subscribers are left.
-                drop(channel_subs); // Release lock before removing
-                self.channels.remove(channel);
+                channels.remove(channel);
             }
         }
     }
@@ -50,7 +55,8 @@ impl PubSubHub {
     /// Publishes a message to all subscribers of a channel.
     /// Returns the number of clients that received the message.
     pub fn publish(&self, channel: Bytes, message: Bytes) -> usize {
-        let Some(subscribers) = self.channels.get(&channel) else {
+        let channels = self.channels();
+        let Some(subscribers) = channels.get(&channel) else {
             return 0;
         };
 
@@ -65,8 +71,7 @@ impl PubSubHub {
         // We iterate over subscribers, cloning their senders. If a send fails,
         // it means the client has disconnected, but we don't handle cleanup here
         // for simplicity. The client's main task handles full cleanup on disconnect.
-        for entry in subscribers.iter() {
-            let sender = entry.value();
+        for sender in subscribers.values() {
             if sender.try_send(message_payload.clone()).is_ok() {
                 recipient_count += 1;
             }
