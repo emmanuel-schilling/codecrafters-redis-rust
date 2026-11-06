@@ -48,7 +48,7 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
 
         Command::XAdd => stream::xadd(&parsed, store, &ctx.waiters),
         Command::XRange => stream::xrange(&parsed, store),
-        Command::XRead => stream::xread(&parsed, store, &ctx.waiters).await,
+        Command::XRead => stream::xread(&parsed, store, &ctx.waiters, true).await,
 
         Command::ZAdd => sorted_set::zadd(&parsed, store),
         Command::ZCard => sorted_set::zcard(&parsed, store),
@@ -70,14 +70,15 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
         Command::Publish => pubsub::publish(&parsed, &ctx.pubsub),
 
         // The connection loop handles these, and the transaction state handles
-        // MULTI, EXEC and DISCARD, before a command is dispatched; anywhere
+        // MULTI, EXEC, DISCARD and WATCH, before a command is dispatched; anywhere
         // else (queued in a transaction, or sent by a master) they're unknown.
         Command::PSync
         | Command::Subscribe
         | Command::Unsubscribe
         | Command::Multi
         | Command::Exec
-        | Command::Discard => Err(AppError::UnknownCommand(parsed.command().to_string())),
+        | Command::Discard
+        | Command::Watch => Err(AppError::UnknownCommand(parsed.command().to_string())),
     };
     reply.unwrap_or_else(RespValue::from)
 }

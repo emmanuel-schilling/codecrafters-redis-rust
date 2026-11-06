@@ -56,7 +56,14 @@ pub fn xrange(parsed: &ParsedCommand, store: &Store) -> Reply {
     })
 }
 
-pub async fn xread(parsed: &ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> Reply {
+/// XREAD [BLOCK ms] STREAMS key ... id ...: with BLOCK, waits for new entries
+/// unless `may_block` is false (inside a transaction), as in Redis.
+pub async fn xread(
+    parsed: &ParsedCommand,
+    store: &Store,
+    waiters: &WaiterRegistry,
+    may_block: bool,
+) -> Reply {
     let mut args = parsed.args_from(0);
     let mut blocking = false;
     let mut block_timeout = None;
@@ -69,7 +76,7 @@ pub async fn xread(parsed: &ParsedCommand, store: &Store, waiters: &WaiterRegist
             return Err(AppError::Syntax);
         }
         let timeout_ms: u64 = parsed.integer(1)?;
-        blocking = true;
+        blocking = may_block;
         block_timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
         args = &args[2..];
     }

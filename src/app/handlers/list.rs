@@ -67,20 +67,7 @@ pub fn lpop(parsed: &ParsedCommand, store: &Store) -> Reply {
 }
 
 pub async fn blpop(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
-    let Some((timeout_str, keys)) = parsed.args_from(0).split_last() else {
-        return Err(AppError::WrongArity(Command::BLPop));
-    };
-    if keys.is_empty() {
-        return Err(AppError::WrongArity(Command::BLPop));
-    }
-
-    let invalid_timeout = || AppError::ValueError("timeout is not a float or out of range".into());
-    let timeout = match parse::<f64>(timeout_str) {
-        None => return Err(invalid_timeout()),
-        Some(secs) if secs < 0.0 => return Err(AppError::ValueError("timeout is negative".into())),
-        Some(0.0) => None,
-        Some(secs) => Some(Duration::try_from_secs_f64(secs).map_err(|_| invalid_timeout())?),
-    };
+    let (keys, timeout) = blpop_args(parsed)?;
 
     // Check and register under the write-order lock, which every push also
     // holds: a push either lands first (and is popped here) or after (and
@@ -105,6 +92,32 @@ pub async fn blpop(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
     Ok(delivered.map_or(RespValue::NullArray, blpop_reply))
 }
 
+/// BLPOP inside a transaction, which doesn't block, as in Redis: it pops at
+/// once or replies with a null array. The caller holds the write-order lock.
+pub fn blpop_now(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
+    let (keys, _) = blpop_args(parsed)?;
+    Ok(pop_first(ctx, keys).map_or(RespValue::NullArray, blpop_reply))
+}
+
+/// BLPOP's keys and timeout (`None` to wait forever).
+fn blpop_args(parsed: &ParsedCommand) -> Result<(&[Bytes], Option<Duration>), AppError> {
+    let Some((timeout_str, keys)) = parsed.args_from(0).split_last() else {
+        return Err(AppError::WrongArity(Command::BLPop));
+    };
+    if keys.is_empty() {
+        return Err(AppError::WrongArity(Command::BLPop));
+    }
+
+    let invalid_timeout = || AppError::ValueError("timeout is not a float or out of range".into());
+    let timeout = match parse::<f64>(timeout_str) {
+        None => return Err(invalid_timeout()),
+        Some(secs) if secs < 0.0 => return Err(AppError::ValueError("timeout is negative".into())),
+        Some(0.0) => None,
+        Some(secs) => Some(Duration::try_from_secs_f64(secs).map_err(|_| invalid_timeout())?),
+    };
+    Ok((keys, timeout))
+}
+
 fn blpop_reply((key, value): Popped) -> RespValue {
     RespValue::Array(vec![
         RespValue::BulkString(key),
@@ -121,7 +134,8 @@ fn lpop_for_replicas(key: &Bytes) -> RespValue {
 }
 
 /// Pops from the first key holding a non-empty list (keys of other types are
-/// skipped) and sends the pop to replicas as LPOP, which never blocks there.
+/// skipped), marks the key changed for WATCH, and sends the pop to replicas
+/// as LPOP, which never blocks there.
 /// The caller holds the write-order lock.
 fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<Popped> {
     let popped = ctx.store.with_keyspace(|ks| {
@@ -136,6 +150,7 @@ fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<Popped> {
         None
     });
     if let Some((key, _)) = &popped {
+        ctx.watches.touch(key);
         ctx.replication.propagate(lpop_for_replicas(key));
     }
     popped

@@ -5,6 +5,7 @@ use crate::app::{
     replication::ReplicationState,
     store::Store,
     wait::WaiterRegistry,
+    watch::WatchRegistry,
 };
 use crate::config::Config;
 use bytes::Bytes;
@@ -30,6 +31,7 @@ pub mod sorted_set;
 pub mod store;
 pub mod stream;
 pub mod wait;
+pub mod watch;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,6 +44,7 @@ pub struct AppContext {
     /// Held while a write runs and is sent to replicas, so replicas receive
     /// writes in the order this server applied them.
     pub write_order: tokio::sync::Mutex<()>,
+    pub watches: WatchRegistry,
 }
 
 impl AppContext {
@@ -59,6 +62,7 @@ impl AppContext {
             pubsub,
             waiters,
             write_order: tokio::sync::Mutex::new(()),
+            watches: WatchRegistry::new(),
         }
     }
 }
@@ -75,6 +79,12 @@ pub enum ConnectionState {
 
 pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    serve_client(stream, client_id, &ctx).await;
+    ctx.watches.unwatch(client_id);
+}
+
+/// Serves a client until it disconnects or becomes a replica.
+async fn serve_client(stream: TcpStream, client_id: u64, ctx: &Arc<AppContext>) {
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
     let mut command_queue: Vec<ParsedCommand> = Vec::new();
@@ -184,8 +194,14 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
                     return;
                 }
 
-                let response =
-                    handle_command(parsed_command, &ctx, &mut state, &mut command_queue).await;
+                let response = handle_command(
+                    parsed_command,
+                    ctx,
+                    client_id,
+                    &mut state,
+                    &mut command_queue,
+                )
+                .await;
 
                 if let Err(e) = framed.send(response).await {
                     error!("failed to send response: {e}");
@@ -201,19 +217,33 @@ pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
     }
 }
 
-/// Runs a command received from the master on a replica.
+/// Runs a write received from the master on a replica.
 pub async fn apply_command(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-    handlers::dispatch(ctx, parsed).await
+    let _order = ctx.write_order.lock().await;
+    let written_key = parsed.written_key().cloned();
+    let response = handlers::dispatch(ctx, parsed).await;
+    if let (Some(key), false) = (written_key, matches!(response, RespValue::Error(_))) {
+        ctx.watches.touch(&key);
+    }
+    response
+}
+
+/// The reply to a write sent by a client to a replica.
+pub(crate) fn read_only_error() -> RespValue {
+    RespValue::Error(Bytes::from_static(
+        b"READONLY You can't write against a read only replica.",
+    ))
 }
 
 pub async fn handle_command(
     parsed: ParsedCommand,
     ctx: &Arc<AppContext>,
+    client_id: u64,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
 ) -> RespValue {
     if let Some(response) =
-        handlers::transaction::handle_state(parsed.clone(), state, queue, ctx).await
+        handlers::transaction::handle_state(&parsed, client_id, state, queue, ctx).await
     {
         return response;
     }
@@ -225,9 +255,7 @@ pub async fn handle_command(
 
     let command = parsed.command();
     if command.is_write() && ctx.replication.role() == replication::Role::Replica {
-        return RespValue::Error(Bytes::from_static(
-            b"READONLY You can't write against a read only replica.",
-        ));
+        return read_only_error();
     }
 
     // BLPOP may block, so it can't hold the write-order lock while it waits;
@@ -236,12 +264,23 @@ pub async fn handle_command(
         return handlers::dispatch(ctx, parsed).await;
     }
 
-    let fed_list = matches!(command, Command::LPush | Command::RPush)
+    let _order = ctx.write_order.lock().await;
+    apply_write(ctx, parsed).await
+}
+
+/// Runs a write and, if it succeeds, marks its key changed for WATCH, sends
+/// it to replicas and serves clients blocked on a list it pushed to. The
+/// caller holds the write-order lock.
+pub(crate) async fn apply_write(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
+    let fed_list = matches!(parsed.command(), Command::LPush | Command::RPush)
         .then(|| parsed.first().cloned())
         .flatten();
-    let _order = ctx.write_order.lock().await;
+    let written_key = parsed.written_key().cloned();
     let response = handlers::dispatch(ctx, parsed.clone()).await;
     if let Some(propagated) = propagated_form(parsed, &response) {
+        if let Some(key) = written_key {
+            ctx.watches.touch(&key);
+        }
         ctx.replication.propagate(propagated);
         if let Some(key) = fed_list {
             handlers::list::serve_blocked_clients(ctx, &key);
@@ -281,6 +320,7 @@ pub(crate) async fn run_test(parts: &[&str], ctx: &Arc<AppContext>) -> RespValue
     handle_command(
         test_command(parts),
         ctx,
+        0,
         &mut ConnectionState::Normal,
         &mut vec![],
     )
@@ -430,10 +470,10 @@ mod tests {
         let mut state = ConnectionState::Normal;
         let mut queue = vec![];
         for parts in [&["MULTI"][..], &["SUBSCRIBE", "a"], &["PSYNC", "?", "-1"]] {
-            handle_command(command(parts), &ctx, &mut state, &mut queue).await;
+            handle_command(command(parts), &ctx, 1, &mut state, &mut queue).await;
         }
         assert_eq!(
-            handle_command(command(&["EXEC"]), &ctx, &mut state, &mut queue).await,
+            handle_command(command(&["EXEC"]), &ctx, 1, &mut state, &mut queue).await,
             RespValue::Array(vec![
                 RespValue::Error(Bytes::from_static(b"ERR unknown command 'SUBSCRIBE'")),
                 RespValue::Error(Bytes::from_static(b"ERR unknown command 'PSYNC'")),

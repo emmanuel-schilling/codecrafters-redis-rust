@@ -25,6 +25,7 @@ pub enum Command {
     Multi,
     Exec,
     Discard,
+    Watch,
     RPush,
     LPush,
     LRange,
@@ -123,6 +124,17 @@ impl ParsedCommand {
 
     pub fn command(&self) -> Command {
         self.command
+    }
+
+    /// The key a write command changes, which clients watching it must see
+    /// as changed. BLPOP marks the key it pops from itself.
+    pub fn written_key(&self) -> Option<&Bytes> {
+        match self.command {
+            Command::BitOp => self.arg(1),
+            Command::BLPop => None,
+            command if command.is_write() => self.arg(0),
+            _ => None,
+        }
     }
 
     pub fn arg(&self, index: usize) -> Option<&Bytes> {
