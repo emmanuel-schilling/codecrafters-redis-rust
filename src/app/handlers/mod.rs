@@ -65,6 +65,7 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
         Command::SetBit => bitmap::setbit(&parsed, store),
         Command::GetBit => bitmap::getbit(&parsed, store),
         Command::BitCount => bitmap::bitcount(&parsed, store),
+        Command::BitOp => bitmap::bitop(&parsed, store),
 
         Command::Publish => pubsub::publish(&parsed, &ctx.pubsub),
 

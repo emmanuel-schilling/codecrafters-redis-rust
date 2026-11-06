@@ -146,6 +146,11 @@ impl Keyspace {
         self.map.insert(key, StoreValue { data, expires_at });
     }
 
+    /// Deletes `key`, whatever it holds.
+    pub fn remove(&mut self, key: &Bytes) {
+        self.map.remove(key);
+    }
+
     /// Deletes `key` if it holds a list or sorted set with no elements left.
     pub fn remove_if_empty(&mut self, key: &Bytes) {
         if self

@@ -111,6 +111,55 @@ pub fn bitcount(parsed: &ParsedCommand, store: &Store) -> Reply {
     })
 }
 
+/// BITOP AND|OR destkey key [key ...]: combines the source strings byte by
+/// byte, stores the result at `destkey` (replacing any value and expiry),
+/// and replies with its length. Shorter and missing sources count as zero
+/// bytes up to the longest source's length. If every source is empty or
+/// missing, `destkey` is deleted, as in Redis.
+pub fn bitop(parsed: &ParsedCommand, store: &Store) -> Reply {
+    let operation = parsed.required(0)?;
+    let combine: fn(u8, u8) -> u8 = if operation.eq_ignore_ascii_case(b"AND") {
+        |a, b| a & b
+    } else if operation.eq_ignore_ascii_case(b"OR") {
+        |a, b| a | b
+    } else {
+        // XOR, NOT and Redis 8's DIFF, DIFF1, ANDOR and ONE aren't supported.
+        return Err(AppError::Syntax);
+    };
+    let dest = parsed.required(1)?;
+    parsed.required(2)?;
+    let sources = parsed.args_from(2);
+
+    store.with_keyspace(|ks| {
+        // Every source is checked before the destination is touched.
+        let values = sources
+            .iter()
+            .map(|key| {
+                Ok(ks
+                    .get_as(key, DataType::as_string)?
+                    .cloned()
+                    .unwrap_or_default())
+            })
+            .collect::<Result<Vec<Bytes>, AppError>>()?;
+        let len = values.iter().map(Bytes::len).max().unwrap_or(0);
+        if len == 0 {
+            ks.remove(dest);
+            return Ok(RespValue::Integer(0));
+        }
+        let result: Vec<u8> = (0..len)
+            .map(|i| {
+                values
+                    .iter()
+                    .map(|value| value.get(i).copied().unwrap_or(0))
+                    .reduce(combine)
+                    .unwrap_or(0)
+            })
+            .collect();
+        ks.set(dest.clone(), DataType::String(Bytes::from(result)), None);
+        Ok(RespValue::Integer(len as i64))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::{run_test as run, test_context, RespValue};
@@ -280,5 +329,106 @@ mod tests {
             assert_eq!(run(parts, &ctx).await, expected, "{parts:?}");
         }
         assert_eq!(run(&["BITCOUNT", "s"], &ctx).await, int(3)); // 'a' is 0b0110_0001
+    }
+
+    /// Runs SETBIT for each offset of `key`.
+    async fn set_bits(ctx: &std::sync::Arc<crate::app::AppContext>, key: &str, offsets: &[u32]) {
+        for offset in offsets {
+            run(&["SETBIT", key, &offset.to_string(), "1"], ctx).await;
+        }
+    }
+
+    fn bulk(bytes: &'static [u8]) -> RespValue {
+        RespValue::BulkString(Bytes::from_static(bytes))
+    }
+
+    #[tokio::test]
+    async fn bitop_and_or_combine_bitmaps_of_the_same_length() {
+        let ctx = test_context();
+        set_bits(&ctx, "key1", &[0, 4]).await; // 10001000
+        set_bits(&ctx, "key2", &[0, 6]).await; // 10000010
+        assert_eq!(
+            run(&["BITOP", "AND", "dest", "key1", "key2"], &ctx).await,
+            int(1)
+        );
+        assert_eq!(run(&["GET", "dest"], &ctx).await, bulk(&[0b1000_0000]));
+        for (offset, bit) in [("0", 1), ("4", 0), ("6", 0)] {
+            assert_eq!(run(&["GETBIT", "dest", offset], &ctx).await, int(bit));
+        }
+        assert_eq!(
+            run(&["BITOP", "or", "dest", "key1", "key2"], &ctx).await,
+            int(1)
+        );
+        assert_eq!(run(&["GET", "dest"], &ctx).await, bulk(&[0b1000_1010]));
+    }
+
+    #[tokio::test]
+    async fn bitop_pads_shorter_and_missing_sources_with_zeros() {
+        let ctx = test_context();
+        set_bits(&ctx, "key1", &[1, 10]).await; // 01000000 00100000
+        set_bits(&ctx, "key2", &[1]).await; // 01000000
+        let cases: [(&[&str], &'static [u8]); 4] = [
+            (&["AND", "dest", "key1", "key2"], &[0b0100_0000, 0]),
+            (&["OR", "dest", "key1", "key2"], &[0b0100_0000, 0b0010_0000]),
+            (&["AND", "dest", "key1", "missing"], &[0, 0]),
+            (
+                &["OR", "dest", "missing", "key2", "key1"],
+                &[0b0100_0000, 0b0010_0000],
+            ),
+        ];
+        for (args, expected) in cases {
+            let mut parts = vec!["BITOP"];
+            parts.extend_from_slice(args);
+            assert_eq!(run(&parts, &ctx).await, int(2), "{parts:?}");
+            assert_eq!(
+                run(&["GET", "dest"], &ctx).await,
+                bulk(expected),
+                "{parts:?}"
+            );
+        }
+        // A single source is copied.
+        assert_eq!(run(&["BITOP", "AND", "copy", "key2"], &ctx).await, int(1));
+        assert_eq!(run(&["GET", "copy"], &ctx).await, bulk(&[0b0100_0000]));
+    }
+
+    #[tokio::test]
+    async fn bitop_replaces_the_destination_or_deletes_it_when_all_sources_are_empty() {
+        let ctx = test_context();
+        set_bits(&ctx, "key1", &[0]).await;
+        run(&["RPUSH", "dest", "x"], &ctx).await;
+        assert_eq!(run(&["BITOP", "OR", "dest", "key1"], &ctx).await, int(1));
+        assert_eq!(
+            run(&["TYPE", "dest"], &ctx).await,
+            RespValue::SimpleString(Bytes::from_static(b"string"))
+        );
+
+        run(&["SET", "empty", ""], &ctx).await;
+        assert_eq!(
+            run(&["BITOP", "AND", "dest", "missing", "empty"], &ctx).await,
+            int(0)
+        );
+        assert_eq!(run(&["GET", "dest"], &ctx).await, RespValue::NullBulkString);
+    }
+
+    #[tokio::test]
+    async fn bitop_rejects_bad_arguments_and_other_types_without_writing() {
+        let ctx = test_context();
+        set_bits(&ctx, "key1", &[0]).await;
+        run(&["RPUSH", "list", "x"], &ctx).await;
+        let arity = error("ERR wrong number of arguments for 'bitop' command");
+        let cases: [(&[&str], RespValue); 5] = [
+            (&["BITOP", "XOR", "dest", "key1"], error("ERR syntax error")),
+            (
+                &["BITOP", "AND", "dest", "key1", "list"],
+                error("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            ),
+            (&["BITOP", "AND", "dest"], arity.clone()),
+            (&["BITOP", "AND"], arity.clone()),
+            (&["BITOP"], arity),
+        ];
+        for (parts, expected) in cases {
+            assert_eq!(run(parts, &ctx).await, expected, "{parts:?}");
+        }
+        assert_eq!(run(&["GET", "dest"], &ctx).await, RespValue::NullBulkString);
     }
 }

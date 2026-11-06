@@ -50,6 +50,7 @@ pub enum Command {
     SetBit,
     GetBit,
     BitCount,
+    BitOp,
 }
 
 impl Command {
@@ -74,6 +75,7 @@ impl Command {
                 | Command::ZRem
                 | Command::GeoAdd
                 | Command::SetBit
+                | Command::BitOp
         )
     }
 }
