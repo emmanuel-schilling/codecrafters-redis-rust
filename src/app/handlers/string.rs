@@ -36,6 +36,17 @@ pub fn get(parsed: &ParsedCommand, store: &Store) -> Reply {
     })
 }
 
+/// STRLEN key: the length of a string in bytes; 0 for a missing key.
+pub fn strlen(parsed: &ParsedCommand, store: &Store) -> Reply {
+    let key = parsed.required(0)?;
+    store.with_keyspace(|ks| {
+        let len = ks
+            .get_as(key, DataType::as_string)?
+            .map_or(0, |value| value.len());
+        Ok(RespValue::Integer(len as i64))
+    })
+}
+
 pub fn incr(parsed: &ParsedCommand, store: &Store) -> Reply {
     let key = parsed.required(0)?;
     store.with_keyspace(|ks| {

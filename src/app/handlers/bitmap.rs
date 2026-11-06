@@ -6,7 +6,7 @@ use crate::app::{
     error::AppError,
     handlers::Reply,
     protocol::RespValue,
-    store::{DataType, Store},
+    store::{resolve_range, DataType, Store},
 };
 use bytes::{Bytes, BytesMut};
 
@@ -81,6 +81,33 @@ pub fn getbit(parsed: &ParsedCommand, store: &Store) -> Reply {
             .get_as(key, DataType::as_string)?
             .is_some_and(|value| bit_at(value, offset));
         Ok(RespValue::Integer(i64::from(bit)))
+    })
+}
+
+/// BITCOUNT key [start end]: the number of set bits, in the whole string or
+/// in the inclusive byte range `start..=end`. Indexes follow Redis's range
+/// rules: an end past the string is clamped, and an empty range counts 0.
+pub fn bitcount(parsed: &ParsedCommand, store: &Store) -> Reply {
+    let key = parsed.required(0)?;
+    let range = match parsed.args_from(1).len() {
+        0 => None,
+        2 => Some((parsed.integer::<i64>(1)?, parsed.integer::<i64>(2)?)),
+        // A start without an end, or the BYTE/BIT option, which isn't supported.
+        _ => return Err(AppError::Syntax),
+    };
+    store.with_keyspace(|ks| {
+        let Some(value) = ks.get_as(key, DataType::as_string)? else {
+            return Ok(RespValue::Integer(0));
+        };
+        let bytes = match range {
+            None => &value[..],
+            Some((start, end)) => match resolve_range(start, end, value.len()) {
+                Some((first, last)) => &value[first..=last],
+                None => &[],
+            },
+        };
+        let count: u64 = bytes.iter().map(|byte| u64::from(byte.count_ones())).sum();
+        Ok(RespValue::Integer(count as i64))
     })
 }
 
@@ -181,5 +208,77 @@ mod tests {
             assert_eq!(run(parts, &ctx).await, expected, "{parts:?}");
         }
         assert_eq!(run(&["GET", "k"], &ctx).await, RespValue::NullBulkString);
+    }
+
+    #[tokio::test]
+    async fn setbit_grows_the_string_and_strlen_counts_bytes() {
+        let ctx = test_context();
+        assert_eq!(run(&["STRLEN", "bitmap_key"], &ctx).await, int(0));
+        run(&["SETBIT", "bitmap_key", "1", "1"], &ctx).await;
+        assert_eq!(run(&["STRLEN", "bitmap_key"], &ctx).await, int(1));
+        assert_eq!(
+            run(&["SETBIT", "bitmap_key", "10", "1"], &ctx).await,
+            int(0)
+        );
+        assert_eq!(run(&["GETBIT", "bitmap_key", "10"], &ctx).await, int(1));
+        assert_eq!(run(&["STRLEN", "bitmap_key"], &ctx).await, int(2));
+        assert_eq!(
+            run(&["GET", "bitmap_key"], &ctx).await,
+            RespValue::BulkString(Bytes::from_static(&[0b0100_0000, 0b0010_0000]))
+        );
+    }
+
+    #[tokio::test]
+    async fn bitcount_counts_the_whole_string_or_a_byte_range() {
+        let ctx = test_context();
+        run(&["SETBIT", "bitmap_key", "1", "1"], &ctx).await;
+        run(&["SETBIT", "bitmap_key", "10", "1"], &ctx).await;
+        let cases: [(&[&str], i64); 9] = [
+            (&[], 2),
+            (&["0", "1"], 2),
+            (&["0", "0"], 1),
+            (&["1", "1"], 1),
+            (&["0", "100"], 2),
+            (&["2", "5"], 0),
+            (&["1", "0"], 0),
+            (&["-1", "-1"], 1),
+            (&["-100", "0"], 1),
+        ];
+        for (range, expected) in cases {
+            let mut parts = vec!["BITCOUNT", "bitmap_key"];
+            parts.extend_from_slice(range);
+            assert_eq!(run(&parts, &ctx).await, int(expected), "{parts:?}");
+        }
+        assert_eq!(run(&["BITCOUNT", "missing"], &ctx).await, int(0));
+        assert_eq!(run(&["BITCOUNT", "missing", "0", "5"], &ctx).await, int(0));
+    }
+
+    #[tokio::test]
+    async fn bitcount_and_strlen_reject_bad_arguments_and_other_types() {
+        let ctx = test_context();
+        run(&["SET", "s", "a"], &ctx).await;
+        run(&["RPUSH", "list", "x"], &ctx).await;
+        let wrongtype = error("WRONGTYPE Operation against a key holding the wrong kind of value");
+        let cases: [(&[&str], RespValue); 6] = [
+            (&["BITCOUNT", "s", "0"], error("ERR syntax error")),
+            (
+                &["BITCOUNT", "s", "0", "1", "BIT"],
+                error("ERR syntax error"),
+            ),
+            (
+                &["BITCOUNT", "s", "x", "1"],
+                error("ERR value is not an integer or out of range"),
+            ),
+            (&["BITCOUNT", "list"], wrongtype.clone()),
+            (&["STRLEN", "list"], wrongtype),
+            (
+                &["STRLEN"],
+                error("ERR wrong number of arguments for 'strlen' command"),
+            ),
+        ];
+        for (parts, expected) in cases {
+            assert_eq!(run(parts, &ctx).await, expected, "{parts:?}");
+        }
+        assert_eq!(run(&["BITCOUNT", "s"], &ctx).await, int(3)); // 'a' is 0b0110_0001
     }
 }

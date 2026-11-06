@@ -29,6 +29,7 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
         Command::Set => string::set(&parsed, store),
         Command::Get => string::get(&parsed, store),
         Command::Incr => string::incr(&parsed, store),
+        Command::StrLen => string::strlen(&parsed, store),
 
         Command::Config => server::config(&parsed, &ctx.config),
         Command::Keys => server::keys(&parsed, store),
@@ -63,6 +64,7 @@ pub async fn dispatch(ctx: &AppContext, parsed: ParsedCommand) -> RespValue {
 
         Command::SetBit => bitmap::setbit(&parsed, store),
         Command::GetBit => bitmap::getbit(&parsed, store),
+        Command::BitCount => bitmap::bitcount(&parsed, store),
 
         Command::Publish => pubsub::publish(&parsed, &ctx.pubsub),
 

@@ -10,6 +10,7 @@ pub enum Command {
     Echo,
     Set,
     Get,
+    StrLen,
     Info,
     ReplConf,
     PSync,
@@ -48,6 +49,7 @@ pub enum Command {
     // Bitmap Commands
     SetBit,
     GetBit,
+    BitCount,
 }
 
 impl Command {
