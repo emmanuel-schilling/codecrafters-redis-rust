@@ -17,10 +17,18 @@ pub fn replconf() -> Reply {
     Ok(RespValue::SimpleString(Bytes::from_static(b"OK")))
 }
 
+/// WAIT inside a transaction, which doesn't wait, as in Redis: the number of
+/// replicas that have acknowledged every write so far.
+pub fn wait_now(parsed: &ParsedCommand, replication: &ReplicationState) -> Reply {
+    let _: usize = parsed.integer(0)?;
+    let _: u64 = parsed.integer(1)?;
+    let synced = replication.count_acks(replication.master_repl_offset());
+    Ok(RespValue::Integer(synced as i64))
+}
+
 /// WAIT: blocks until enough replicas acknowledge every write so far, or until
 /// the timeout; a timeout of 0 waits indefinitely.
 pub async fn wait(parsed: &ParsedCommand, replication: &ReplicationState) -> Reply {
-    parsed.required(1)?;
     let num_replicas: usize = parsed.integer(0)?;
     let timeout_ms: u64 = parsed.integer(1)?;
 

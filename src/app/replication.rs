@@ -271,6 +271,8 @@ async fn perform_handshake(
     info!("RDB file consumed. Listening for propagated commands.");
 
     let mut offset = 0usize;
+    // The writes of a transaction from the master, between its MULTI and EXEC.
+    let mut transaction: Option<Vec<ParsedCommand>> = None;
     loop {
         match framed.next().await {
             Some(Ok(value)) => {
@@ -279,14 +281,16 @@ async fn perform_handshake(
                 match ParsedCommand::from_resp(value) {
                     Ok(parsed_command) => {
                         let cmd = parsed_command.command();
-                        if cmd.is_write() {
-                            let response = crate::app::apply_command(&ctx, parsed_command).await;
-                            if let RespValue::Error(e) = response {
-                                warn!(
-                                    "Replica failed to apply write command {:?}: {}",
-                                    cmd,
-                                    String::from_utf8_lossy(&e)
-                                );
+                        if cmd == Command::Multi {
+                            transaction = Some(Vec::new());
+                        } else if cmd == Command::Exec {
+                            if let Some(writes) = transaction.take() {
+                                crate::app::apply_from_master(&ctx, &writes);
+                            }
+                        } else if cmd.is_write() {
+                            match &mut transaction {
+                                Some(writes) => writes.push(parsed_command),
+                                None => crate::app::apply_from_master(&ctx, &[parsed_command]),
                             }
                         } else if cmd == Command::ReplConf
                             && parsed_command

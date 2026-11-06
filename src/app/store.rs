@@ -4,7 +4,7 @@ use crate::app::stream::Stream;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub enum DataType {
@@ -100,16 +100,45 @@ impl Store {
     }
 }
 
-/// The keys and values. Every lookup treats an expired key as missing and deletes it.
+/// How lookups treat a key whose expiry time has passed. Only a master
+/// deletes expired keys; it sends replicas a DEL for each, so replicas stay
+/// the same as their master however their clocks differ.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// On a master: the key is deleted, and recorded for replicas.
+    #[default]
+    Delete,
+    /// For a replica's clients: the key is missing, but stays until the master deletes it.
+    Hide,
+    /// For writes a replica receives from its master: the key is live.
+    Ignore,
+}
+
+/// The keys and values. Lookups treat an expired key as `expiry` says.
 #[derive(Debug, Default)]
 pub struct Keyspace {
     map: HashMap<Bytes, StoreValue>,
+    expiry: Expiry,
+    /// Keys deleted because they expired, not yet sent to replicas.
+    expired: Vec<Bytes>,
 }
 
 impl Keyspace {
+    /// Sets how lookups treat expired keys.
+    pub fn set_expiry(&mut self, expiry: Expiry) {
+        self.expiry = expiry;
+    }
+
+    /// Takes the keys deleted because they expired since the last call.
+    pub fn take_expired(&mut self) -> Vec<Bytes> {
+        std::mem::take(&mut self.expired)
+    }
+
     /// The value at `key`, or `None` if it is missing or has expired.
     pub fn get(&mut self, key: &Bytes) -> Option<&mut DataType> {
-        self.evict_if_expired(key);
+        if self.expire(key) {
+            return None;
+        }
         self.map.get_mut(key).map(|value| &mut value.data)
     }
 
@@ -133,7 +162,11 @@ impl Keyspace {
         view: fn(&mut DataType) -> Option<&mut T>,
         empty: impl FnOnce() -> DataType,
     ) -> Result<&mut T, AppError> {
-        self.evict_if_expired(key);
+        // Only writes create keys, and a replica's clients can't write, so
+        // an expired key here has already been deleted (or is being ignored).
+        if self.expire(key) {
+            self.map.remove(key);
+        }
         let value = self.map.entry(key.clone()).or_insert_with(|| StoreValue {
             data: empty(),
             expires_at: None,
@@ -146,9 +179,9 @@ impl Keyspace {
         self.map.insert(key, StoreValue { data, expires_at });
     }
 
-    /// Deletes `key`, whatever it holds.
-    pub fn remove(&mut self, key: &Bytes) {
-        self.map.remove(key);
+    /// Deletes `key`, whatever it holds, and returns whether it existed.
+    pub fn remove(&mut self, key: &Bytes) -> bool {
+        !self.expire(key) && self.map.remove(key).is_some()
     }
 
     /// Deletes `key` if it holds a list or sorted set with no elements left.
@@ -167,7 +200,7 @@ impl Keyspace {
         let now = Instant::now();
         self.map
             .iter()
-            .filter(|(_, value)| !value.is_expired(now))
+            .filter(|(_, value)| self.expiry == Expiry::Ignore || !value.is_expired(now))
             .map(|(key, _)| key.clone())
             .collect()
     }
@@ -177,14 +210,32 @@ impl Keyspace {
         self.get(key).map_or("none", |data| data.type_name())
     }
 
-    fn evict_if_expired(&mut self, key: &Bytes) {
-        if self
-            .map
-            .get(key)
-            .is_some_and(|value| value.is_expired(Instant::now()))
-        {
+    /// Applies `expiry` to `key` if it has expired, and returns whether the
+    /// key is now missing to the command looking it up.
+    fn expire(&mut self, key: &Bytes) -> bool {
+        let expired = self.expiry != Expiry::Ignore
+            && self
+                .map
+                .get(key)
+                .is_some_and(|value| value.is_expired(Instant::now()));
+        if expired && self.expiry == Expiry::Delete {
             self.map.remove(key);
+            self.expired.push(key.clone());
         }
+        expired
+    }
+}
+
+/// Converts an expiry time, given as time since the Unix epoch, into an `Instant`.
+/// A past expiry gives a past `Instant` (or now, if that can't be represented);
+/// one too far ahead to represent gives `None`, meaning the key never expires.
+pub fn instant_at(since_epoch: Duration) -> Option<Instant> {
+    let now_sys = SystemTime::now();
+    let now = Instant::now();
+    let target = UNIX_EPOCH.checked_add(since_epoch)?;
+    match target.duration_since(now_sys) {
+        Ok(ahead) => now.checked_add(ahead),
+        Err(behind) => Some(now.checked_sub(behind.duration()).unwrap_or(now)),
     }
 }
 
@@ -212,7 +263,6 @@ pub fn resolve_range(start: i64, stop: i64, len: usize) -> Option<(usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn key(k: &'static str) -> Bytes {
         Bytes::from_static(k.as_bytes())
@@ -300,5 +350,24 @@ mod tests {
                 "{start} {stop} {len}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_master_deletes_expired_keys_and_records_them() {
+        let mut ks = Keyspace::default();
+        ks.set(key("old"), string("v"), past());
+        ks.set_expiry(Expiry::Hide);
+        assert!(ks.get(&key("old")).is_none());
+        assert!(ks.keys().is_empty());
+        assert!(ks.map.contains_key(&key("old")), "a replica keeps it");
+
+        ks.set_expiry(Expiry::Ignore);
+        assert!(ks.get(&key("old")).is_some(), "the master's writes see it");
+        assert_eq!(ks.keys(), vec![key("old")]);
+
+        ks.set_expiry(Expiry::Delete);
+        assert!(!ks.remove(&key("old")), "it had expired");
+        assert_eq!(ks.take_expired(), vec![key("old")]);
+        assert!(ks.take_expired().is_empty());
     }
 }

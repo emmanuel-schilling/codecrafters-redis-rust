@@ -1,10 +1,10 @@
-use crate::app::store::{DataType, StoreValue};
+use crate::app::store::{self, DataType, StoreValue};
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fs;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tracing::debug;
 
 /// A minimal RDB file (version 11) holding no keys.
@@ -55,11 +55,11 @@ fn parse(file: &[u8]) -> Result<HashMap<Bytes, StoreValue>> {
             }
             0xFD => {
                 let seconds = u32::from_le_bytes(reader.array()?);
-                expires_at = to_instant(Duration::from_secs(u64::from(seconds)));
+                expires_at = store::instant_at(Duration::from_secs(u64::from(seconds)));
             }
             0xFC => {
                 let millis = u64::from_le_bytes(reader.array()?);
-                expires_at = to_instant(Duration::from_millis(millis));
+                expires_at = store::instant_at(Duration::from_millis(millis));
             }
             0xFF => break, // End of file; a checksum follows.
             0x00 => {
@@ -158,22 +158,10 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Converts an expiry time, given as time since the Unix epoch, into an `Instant`.
-/// A past expiry gives a past `Instant` (or now, if that can't be represented);
-/// one too far ahead to represent gives `None`, meaning the key never expires.
-fn to_instant(since_epoch: Duration) -> Option<Instant> {
-    let now_sys = SystemTime::now();
-    let now = Instant::now();
-    let target = UNIX_EPOCH.checked_add(since_epoch)?;
-    match target.duration_since(now_sys) {
-        Ok(ahead) => now.checked_add(ahead),
-        Err(behind) => Some(now.checked_sub(behind.duration()).unwrap_or(now)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     /// Wraps database opcodes in an RDB header, end marker and (unchecked) checksum.
     fn rdb(body: &[u8]) -> Vec<u8> {
@@ -290,7 +278,7 @@ mod tests {
     fn handles_the_largest_expiry_without_panicking() {
         // How far ahead an `Instant` can reach differs by platform, so this
         // gives either "never expires" or a future time.
-        let expiry = to_instant(Duration::from_millis(u64::MAX));
+        let expiry = store::instant_at(Duration::from_millis(u64::MAX));
         assert!(expiry.is_none_or(|t| t > Instant::now()));
     }
 }

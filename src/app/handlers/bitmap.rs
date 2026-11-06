@@ -4,9 +4,10 @@
 use crate::app::{
     command::{parse, ParsedCommand},
     error::AppError,
+    exec::Changes,
     handlers::Reply,
     protocol::RespValue,
-    store::{resolve_range, DataType, Store},
+    store::{resolve_range, DataType, Keyspace},
 };
 use bytes::{Bytes, BytesMut};
 
@@ -35,7 +36,7 @@ fn mask(offset: usize) -> u8 {
 
 /// SETBIT key offset 0|1: sets or clears a bit, growing the string with zero
 /// bytes as needed, and replies with the bit's previous value.
-pub fn setbit(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn setbit(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let key = parsed.required(0)?;
     let bit = match &parsed.required(2)?[..] {
         b"0" => false,
@@ -48,46 +49,46 @@ pub fn setbit(parsed: &ParsedCommand, store: &Store) -> Reply {
     };
     let offset = bit_offset(parsed, 1)?;
 
-    store.with_keyspace(|ks| {
-        let value =
-            ks.get_or_create_as(key, DataType::as_string, || DataType::String(Bytes::new()))?;
-        // Reuses the buffer unless the value is shared (e.g. by a reply still
-        // being sent), in which case it's copied.
-        let mut bytes = std::mem::take(value)
-            .try_into_mut()
-            .unwrap_or_else(|shared| BytesMut::from(&shared[..]));
-        let index = offset / 8;
-        if bytes.len() <= index {
-            bytes.resize(index + 1, 0);
-        }
-        let previous = bit_at(&bytes, offset);
-        if bit {
-            bytes[index] |= mask(offset);
-        } else {
-            bytes[index] &= !mask(offset);
-        }
-        *value = bytes.freeze();
-        Ok(RespValue::Integer(i64::from(previous)))
-    })
+    let value = ks.get_or_create_as(key, DataType::as_string, || DataType::String(Bytes::new()))?;
+    // Reuses the buffer unless the value is shared (e.g. by a reply still
+    // being sent), in which case it's copied.
+    let mut bytes = std::mem::take(value)
+        .try_into_mut()
+        .unwrap_or_else(|shared| BytesMut::from(&shared[..]));
+    let index = offset / 8;
+    let grown = bytes.len() <= index;
+    if grown {
+        bytes.resize(index + 1, 0);
+    }
+    let previous = bit_at(&bytes, offset);
+    if bit {
+        bytes[index] |= mask(offset);
+    } else {
+        bytes[index] &= !mask(offset);
+    }
+    *value = bytes.freeze();
+    // A new key is created empty, so it always grows.
+    if grown || previous != bit {
+        changes.wrote(key);
+    }
+    Ok(RespValue::Integer(i64::from(previous)))
 }
 
 /// GETBIT key offset: the bit at `offset`; 0 for a missing key or an offset
 /// past the end of the string.
-pub fn getbit(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn getbit(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
     let offset = bit_offset(parsed, 1)?;
-    store.with_keyspace(|ks| {
-        let bit = ks
-            .get_as(key, DataType::as_string)?
-            .is_some_and(|value| bit_at(value, offset));
-        Ok(RespValue::Integer(i64::from(bit)))
-    })
+    let bit = ks
+        .get_as(key, DataType::as_string)?
+        .is_some_and(|value| bit_at(value, offset));
+    Ok(RespValue::Integer(i64::from(bit)))
 }
 
 /// BITCOUNT key [start end]: the number of set bits, in the whole string or
 /// in the inclusive byte range `start..=end`. Indexes follow Redis's range
 /// rules: an end past the string is clamped, and an empty range counts 0.
-pub fn bitcount(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn bitcount(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
     let range = match parsed.args_from(1).len() {
         0 => None,
@@ -95,20 +96,18 @@ pub fn bitcount(parsed: &ParsedCommand, store: &Store) -> Reply {
         // A start without an end, or the BYTE/BIT option, which isn't supported.
         _ => return Err(AppError::Syntax),
     };
-    store.with_keyspace(|ks| {
-        let Some(value) = ks.get_as(key, DataType::as_string)? else {
-            return Ok(RespValue::Integer(0));
-        };
-        let bytes = match range {
-            None => &value[..],
-            Some((start, end)) => match resolve_range(start, end, value.len()) {
-                Some((first, last)) => &value[first..=last],
-                None => &[],
-            },
-        };
-        let count: u64 = bytes.iter().map(|byte| u64::from(byte.count_ones())).sum();
-        Ok(RespValue::Integer(count as i64))
-    })
+    let Some(value) = ks.get_as(key, DataType::as_string)? else {
+        return Ok(RespValue::Integer(0));
+    };
+    let bytes = match range {
+        None => &value[..],
+        Some((start, end)) => match resolve_range(start, end, value.len()) {
+            Some((first, last)) => &value[first..=last],
+            None => &[],
+        },
+    };
+    let count: u64 = bytes.iter().map(|byte| u64::from(byte.count_ones())).sum();
+    Ok(RespValue::Integer(count as i64))
 }
 
 /// BITOP AND|OR destkey key [key ...]: combines the source strings byte by
@@ -116,7 +115,7 @@ pub fn bitcount(parsed: &ParsedCommand, store: &Store) -> Reply {
 /// and replies with its length. Shorter and missing sources count as zero
 /// bytes up to the longest source's length. If every source is empty or
 /// missing, `destkey` is deleted, as in Redis.
-pub fn bitop(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn bitop(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let operation = parsed.required(0)?;
     let combine: fn(u8, u8) -> u8 = if operation.eq_ignore_ascii_case(b"AND") {
         |a, b| a & b
@@ -127,37 +126,37 @@ pub fn bitop(parsed: &ParsedCommand, store: &Store) -> Reply {
         return Err(AppError::Syntax);
     };
     let dest = parsed.required(1)?;
-    parsed.required(2)?;
     let sources = parsed.args_from(2);
 
-    store.with_keyspace(|ks| {
-        // Every source is checked before the destination is touched.
-        let values = sources
-            .iter()
-            .map(|key| {
-                Ok(ks
-                    .get_as(key, DataType::as_string)?
-                    .cloned()
-                    .unwrap_or_default())
-            })
-            .collect::<Result<Vec<Bytes>, AppError>>()?;
-        let len = values.iter().map(Bytes::len).max().unwrap_or(0);
-        if len == 0 {
-            ks.remove(dest);
-            return Ok(RespValue::Integer(0));
+    // Every source is checked before the destination is touched.
+    let values = sources
+        .iter()
+        .map(|key| {
+            Ok(ks
+                .get_as(key, DataType::as_string)?
+                .cloned()
+                .unwrap_or_default())
+        })
+        .collect::<Result<Vec<Bytes>, AppError>>()?;
+    let len = values.iter().map(Bytes::len).max().unwrap_or(0);
+    if len == 0 {
+        if ks.remove(dest) {
+            changes.wrote(dest);
         }
-        let result: Vec<u8> = (0..len)
-            .map(|i| {
-                values
-                    .iter()
-                    .map(|value| value.get(i).copied().unwrap_or(0))
-                    .reduce(combine)
-                    .unwrap_or(0)
-            })
-            .collect();
-        ks.set(dest.clone(), DataType::String(Bytes::from(result)), None);
-        Ok(RespValue::Integer(len as i64))
-    })
+        return Ok(RespValue::Integer(0));
+    }
+    let result: Vec<u8> = (0..len)
+        .map(|i| {
+            values
+                .iter()
+                .map(|value| value.get(i).copied().unwrap_or(0))
+                .reduce(combine)
+                .unwrap_or(0)
+        })
+        .collect();
+    ks.set(dest.clone(), DataType::String(Bytes::from(result)), None);
+    changes.wrote(dest);
+    Ok(RespValue::Integer(len as i64))
 }
 
 #[cfg(test)]

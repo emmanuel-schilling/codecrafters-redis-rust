@@ -1,35 +1,42 @@
 use crate::app::{
-    apply_write,
     command::{Command, ParsedCommand},
-    handlers::{dispatch, list, stream},
-    read_only_error,
+    exec, read_only_error,
     replication::Role,
     AppContext, ConnectionState, RespValue,
 };
 use bytes::Bytes;
-use std::sync::Arc;
 
-/// Handles MULTI, EXEC, DISCARD and WATCH, which act on the connection's
-/// transaction state. Returns `None` for any other command.
-pub async fn handle_state(
+/// Handles MULTI, EXEC, DISCARD, WATCH and (outside a transaction) UNWATCH,
+/// which act on the connection's transaction state. Returns `None` for any
+/// other command.
+pub fn handle_state(
     parsed: &ParsedCommand,
     client_id: u64,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
-    ctx: &Arc<AppContext>,
+    ctx: &AppContext,
 ) -> Option<RespValue> {
-    let in_transaction = matches!(state, ConnectionState::InTransaction);
+    let (in_transaction, aborted) = match state {
+        ConnectionState::InTransaction { aborted } => (true, *aborted),
+        _ => (false, false),
+    };
     let reply = match parsed.command() {
         Command::Multi if in_transaction => error("ERR MULTI calls can not be nested"),
         Command::Multi => {
-            *state = ConnectionState::InTransaction;
+            *state = ConnectionState::InTransaction { aborted: false };
             queue.clear();
             ok()
         }
         Command::Exec if !in_transaction => error("ERR EXEC without MULTI"),
         Command::Exec => {
             *state = ConnectionState::Normal;
-            exec(std::mem::take(queue), client_id, ctx).await
+            let queue = std::mem::take(queue);
+            if aborted {
+                ctx.watches.unwatch(client_id);
+                error("EXECABORT Transaction discarded because of previous errors.")
+            } else {
+                exec(queue, client_id, ctx)
+            }
         }
         Command::Discard if !in_transaction => error("ERR DISCARD without MULTI"),
         Command::Discard => {
@@ -46,45 +53,48 @@ pub async fn handle_state(
                 ok()
             }
         },
+        // Inside a transaction UNWATCH is queued, as in Redis.
+        Command::Unwatch if !in_transaction => {
+            ctx.watches.unwatch(client_id);
+            ok()
+        }
         _ => return None,
     };
     Some(reply)
 }
 
-/// Runs a transaction's queued commands with no other client's write in
-/// between, or none of them (replying with a null array) if a key the client
-/// watches was written since it watched it. Either way the client stops
-/// watching its keys.
-async fn exec(queue: Vec<ParsedCommand>, client_id: u64, ctx: &Arc<AppContext>) -> RespValue {
-    // Every write touches its key while holding this lock, so no write can
-    // land between the check and the last queued command.
-    let _order = ctx.write_order.lock().await;
-    if ctx.watches.unwatch(client_id) {
-        return RespValue::NullArray;
+/// Records that a command was rejected (unknown, or with the wrong number of
+/// arguments); if a transaction is being queued, its EXEC will fail.
+pub fn reject_while_queuing(state: &mut ConnectionState) {
+    if let ConnectionState::InTransaction { aborted } = state {
+        *aborted = true;
     }
-    let mut replies = Vec::with_capacity(queue.len());
-    for parsed in queue {
-        replies.push(run_queued(parsed, ctx).await);
-    }
-    RespValue::Array(replies)
 }
 
-/// Runs one queued command. The caller holds the write-order lock, so
-/// blocking commands don't block: as in Redis, BLPOP and XREAD BLOCK reply at
-/// once, with a null array if there's nothing to return.
-async fn run_queued(parsed: ParsedCommand, ctx: &Arc<AppContext>) -> RespValue {
-    let command = parsed.command();
-    if command.is_write() && ctx.replication.role() == Role::Replica {
-        return read_only_error();
-    }
-    match command {
-        Command::BLPop => list::blpop_now(&parsed, ctx).unwrap_or_else(RespValue::from),
-        Command::XRead => stream::xread(&parsed, &ctx.store, &ctx.waiters, false)
-            .await
-            .unwrap_or_else(RespValue::from),
-        _ if command.is_write() => apply_write(ctx, parsed).await,
-        _ => dispatch(ctx, parsed).await,
-    }
+/// Runs a transaction's queued commands in one locked section, so no other
+/// client sees or changes the keyspace between them, or runs none of them
+/// (replying with a null array) if a key the client watches was written since
+/// it watched it. Either way the client stops watching its keys. Replicas
+/// receive the transaction's writes wrapped in MULTI and EXEC.
+fn exec(queue: Vec<ParsedCommand>, client_id: u64, ctx: &AppContext) -> RespValue {
+    exec::locked(ctx, |ks, outbox| {
+        if ctx.watches.unwatch(client_id) {
+            return RespValue::NullArray;
+        }
+        let mut applied = exec::Outbox::new();
+        let replies = queue
+            .iter()
+            .map(|parsed| {
+                if parsed.command().is_write() && ctx.replication.role() == Role::Replica {
+                    read_only_error()
+                } else {
+                    exec::run(ctx, ks, parsed, &mut applied)
+                }
+            })
+            .collect();
+        outbox.extend(exec::as_transaction(applied));
+        RespValue::Array(replies)
+    })
 }
 
 fn ok() -> RespValue {
@@ -282,8 +292,77 @@ mod tests {
         let ctx = test_context();
         let mut client = Client::new(1);
         client.run(&["WATCH", "k"], &ctx).await;
-        crate::app::apply_command(&ctx, test_command(&["SET", "k", "v"])).await;
+        crate::app::apply_from_master(&ctx, &[test_command(&["SET", "k", "v"])]);
         client.run(&["MULTI"], &ctx).await;
         assert_eq!(client.run(&["EXEC"], &ctx).await, RespValue::NullArray);
+    }
+
+    #[tokio::test]
+    async fn a_command_rejected_while_queuing_fails_the_transaction() {
+        let ctx = test_context();
+        let mut client = Client::new(1);
+        client.run(&["WATCH", "w"], &ctx).await;
+        client.run(&["MULTI"], &ctx).await;
+        assert_eq!(client.run(&["SET", "a", "1"], &ctx).await, queued());
+        assert_eq!(
+            client.run(&["GET"], &ctx).await,
+            error("ERR wrong number of arguments for 'get' command")
+        );
+        assert_eq!(client.run(&["SET", "b", "1"], &ctx).await, queued());
+        assert_eq!(
+            client.run(&["EXEC"], &ctx).await,
+            error("EXECABORT Transaction discarded because of previous errors.")
+        );
+        assert_eq!(run(&["GET", "a"], &ctx).await, RespValue::NullBulkString);
+
+        // The watches are cleared and the next transaction starts afresh.
+        run(&["SET", "w", "1"], &ctx).await;
+        client.run(&["MULTI"], &ctx).await;
+        client.run(&["SET", "a", "1"], &ctx).await;
+        assert_eq!(
+            client.run(&["EXEC"], &ctx).await,
+            RespValue::Array(vec![ok()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_error_fails_only_its_own_command() {
+        let ctx = test_context();
+        let mut client = Client::new(1);
+        run(&["SET", "s", "x"], &ctx).await;
+        client.run(&["MULTI"], &ctx).await;
+        client.run(&["INCR", "s"], &ctx).await;
+        client.run(&["SET", "a", "1"], &ctx).await;
+        assert_eq!(
+            client.run(&["EXEC"], &ctx).await,
+            RespValue::Array(vec![
+                error("ERR value is not an integer or out of range"),
+                ok()
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn unwatch_forgets_the_watched_keys() {
+        let ctx = test_context();
+        let mut client = Client::new(1);
+        assert_eq!(client.run(&["UNWATCH"], &ctx).await, ok());
+        run(&["SET", "foo", "100"], &ctx).await;
+        client.run(&["WATCH", "foo", "bar"], &ctx).await;
+        run(&["SET", "foo", "200"], &ctx).await;
+        assert_eq!(client.run(&["UNWATCH"], &ctx).await, ok());
+        client.run(&["MULTI"], &ctx).await;
+        client.run(&["SET", "foo", "400"], &ctx).await;
+        // Queued inside a transaction; EXEC has already cleared the watches when it runs.
+        assert_eq!(client.run(&["UNWATCH"], &ctx).await, queued());
+        assert_eq!(
+            client.run(&["EXEC"], &ctx).await,
+            RespValue::Array(vec![ok(), ok()])
+        );
+        assert_eq!(run(&["GET", "foo"], &ctx).await, bulk("400"));
+        assert_eq!(
+            client.run(&["UNWATCH", "foo"], &ctx).await,
+            error("ERR wrong number of arguments for 'unwatch' command")
+        );
     }
 }

@@ -11,6 +11,7 @@ pub enum Command {
     Set,
     Get,
     StrLen,
+    Del,
     Info,
     ReplConf,
     PSync,
@@ -26,6 +27,7 @@ pub enum Command {
     Exec,
     Discard,
     Watch,
+    Unwatch,
     RPush,
     LPush,
     LRange,
@@ -60,12 +62,54 @@ impl Command {
         self.to_string().to_lowercase()
     }
 
+    /// The number of parts the command takes, counting its name, as Redis
+    /// gives it: `n` means exactly `n`, and `-n` means at least `n`.
+    fn arity(self) -> i32 {
+        match self {
+            Command::Multi | Command::Exec | Command::Discard | Command::Unwatch => 1,
+            Command::Echo
+            | Command::Get
+            | Command::StrLen
+            | Command::Incr
+            | Command::Keys
+            | Command::Type
+            | Command::LLen
+            | Command::ZCard => 2,
+            Command::Wait | Command::Publish | Command::ZScore | Command::GetBit => 3,
+            Command::LRange | Command::SetBit => 4,
+            Command::Ping | Command::Info | Command::ReplConf | Command::Unsubscribe => -1,
+            Command::Config
+            | Command::Watch
+            | Command::Del
+            | Command::LPop
+            | Command::Subscribe
+            | Command::GeoPos
+            | Command::BitCount => -2,
+            Command::Set
+            | Command::PSync
+            | Command::RPush
+            | Command::LPush
+            | Command::BLPop
+            | Command::ZRank
+            | Command::ZRem => -3,
+            Command::XRange
+            | Command::XRead
+            | Command::ZAdd
+            | Command::ZRange
+            | Command::GeoDist
+            | Command::BitOp => -4,
+            Command::XAdd | Command::GeoAdd => -5,
+            Command::GeoSearch => -7,
+        }
+    }
+
     /// Whether the command can change the keyspace. Replicas reject these from
     /// clients, and a master sends them to its replicas once they succeed.
     pub fn is_write(self) -> bool {
         matches!(
             self,
             Command::Set
+                | Command::Del
                 | Command::Incr
                 | Command::LPush
                 | Command::RPush
@@ -126,14 +170,20 @@ impl ParsedCommand {
         self.command
     }
 
-    /// The key a write command changes, which clients watching it must see
-    /// as changed. BLPOP marks the key it pops from itself.
-    pub fn written_key(&self) -> Option<&Bytes> {
-        match self.command {
-            Command::BitOp => self.arg(1),
-            Command::BLPop => None,
-            command if command.is_write() => self.arg(0),
-            _ => None,
+    /// Checks the number of arguments against the command's arity.
+    pub fn check_arity(&self) -> Result<(), AppError> {
+        let parts = self.args.len() + 1;
+        let arity = self.command.arity();
+        let needed = arity.unsigned_abs() as usize;
+        let fits = if arity < 0 {
+            parts >= needed
+        } else {
+            parts == needed
+        };
+        if fits {
+            Ok(())
+        } else {
+            Err(AppError::WrongArity(self.command))
         }
     }
 
@@ -237,5 +287,23 @@ mod tests {
             reply(parsed.integer::<i64>(9)),
             "ERR wrong number of arguments for 'blpop' command"
         );
+    }
+
+    #[test]
+    fn arity_counts_the_name_and_allows_more_for_negative_arities() {
+        let arity_error = |parts: &[&str]| command(parts).check_arity().map_err(|e| e.to_string());
+        let wrong = |name: &str| {
+            Err(format!(
+                "ERR wrong number of arguments for '{name}' command"
+            ))
+        };
+        assert_eq!(arity_error(&["GET", "k"]), Ok(()));
+        assert_eq!(arity_error(&["GET"]), wrong("get"));
+        assert_eq!(arity_error(&["GET", "k", "extra"]), wrong("get"));
+        assert_eq!(arity_error(&["MULTI", "x"]), wrong("multi"));
+        assert_eq!(arity_error(&["PING"]), Ok(()));
+        assert_eq!(arity_error(&["PING", "hi"]), Ok(()));
+        assert_eq!(arity_error(&["RPUSH", "k", "a", "b", "c"]), Ok(()));
+        assert_eq!(arity_error(&["RPUSH", "k"]), wrong("rpush"));
     }
 }

@@ -1,95 +1,103 @@
 use crate::app::{
     command::ParsedCommand,
+    exec::Changes,
     handlers::Reply,
     protocol::RespValue,
     sorted_set::SortedSet,
-    store::{resolve_range, DataType, Store},
+    store::{resolve_range, DataType, Keyspace},
 };
 use bytes::Bytes;
 
-pub fn zadd(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn zadd(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let key = parsed.required(0)?;
     let member = parsed.required(2)?;
     let score = parsed.float(1)?;
-    store.with_keyspace(|ks| {
-        let zset = ks.get_or_create_as(key, DataType::as_sorted_set, || {
-            DataType::SortedSet(SortedSet::new())
-        })?;
-        Ok(RespValue::Integer(zset.add(score, member.clone()) as i64))
-    })
+    add_member(ks, changes, key, score, member)
 }
 
-pub fn zcard(parsed: &ParsedCommand, store: &Store) -> Reply {
+/// Adds `member` with `score`, or updates its score, and replies with the
+/// number of members added. The set changes unless the score was already `score`.
+pub fn add_member(
+    ks: &mut Keyspace,
+    changes: &mut Changes,
+    key: &Bytes,
+    score: f64,
+    member: &Bytes,
+) -> Reply {
+    let zset = ks.get_or_create_as(key, DataType::as_sorted_set, || {
+        DataType::SortedSet(SortedSet::new())
+    })?;
+    let unchanged = zset.score_of(member) == Some(score);
+    let added = zset.add(score, member.clone());
+    if !unchanged {
+        changes.wrote(key);
+    }
+    Ok(RespValue::Integer(added as i64))
+}
+
+pub fn zcard(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
-    store.with_keyspace(|ks| {
-        let count = ks
+    let count = ks
+        .get_as(key, DataType::as_sorted_set)?
+        .map_or(0, |zset| zset.cardinality());
+    Ok(RespValue::Integer(count as i64))
+}
+
+pub fn zscore(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
+    let key = parsed.required(0)?;
+    let member = parsed.required(1)?;
+    Ok(
+        match ks
             .get_as(key, DataType::as_sorted_set)?
-            .map_or(0, |zset| zset.cardinality());
-        Ok(RespValue::Integer(count as i64))
-    })
+            .and_then(|zset| zset.score_of(member))
+        {
+            Some(score) => RespValue::BulkString(Bytes::from(score.to_string())),
+            None => RespValue::NullBulkString,
+        },
+    )
 }
 
-pub fn zscore(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn zrank(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
     let member = parsed.required(1)?;
-    store.with_keyspace(|ks| {
-        Ok(
-            match ks
-                .get_as(key, DataType::as_sorted_set)?
-                .and_then(|zset| zset.score_of(member))
-            {
-                Some(score) => RespValue::BulkString(Bytes::from(score.to_string())),
-                None => RespValue::NullBulkString,
-            },
-        )
-    })
+    Ok(
+        match ks
+            .get_as(key, DataType::as_sorted_set)?
+            .and_then(|zset| zset.rank_of(member))
+        {
+            Some(rank) => RespValue::Integer(rank as i64),
+            None => RespValue::NullBulkString,
+        },
+    )
 }
 
-pub fn zrank(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn zrange(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
-    let member = parsed.required(1)?;
-    store.with_keyspace(|ks| {
-        Ok(
-            match ks
-                .get_as(key, DataType::as_sorted_set)?
-                .and_then(|zset| zset.rank_of(member))
-            {
-                Some(rank) => RespValue::Integer(rank as i64),
-                None => RespValue::NullBulkString,
-            },
-        )
-    })
-}
-
-pub fn zrange(parsed: &ParsedCommand, store: &Store) -> Reply {
-    let key = parsed.required(0)?;
-    parsed.required(2)?;
     let start: i64 = parsed.integer(1)?;
     let stop: i64 = parsed.integer(2)?;
-    store.with_keyspace(|ks| {
-        let members = match ks.get_as(key, DataType::as_sorted_set)? {
-            Some(zset) => resolve_range(start, stop, zset.cardinality())
-                .map(|(first, last)| zset.get_range(first, last))
-                .unwrap_or_default(),
-            None => vec![],
-        };
-        Ok(RespValue::Array(
-            members.into_iter().map(RespValue::BulkString).collect(),
-        ))
-    })
+    let members = match ks.get_as(key, DataType::as_sorted_set)? {
+        Some(zset) => resolve_range(start, stop, zset.cardinality())
+            .map(|(first, last)| zset.get_range(first, last))
+            .unwrap_or_default(),
+        None => vec![],
+    };
+    Ok(RespValue::Array(
+        members.into_iter().map(RespValue::BulkString).collect(),
+    ))
 }
 
-pub fn zrem(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn zrem(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let key = parsed.required(0)?;
     let member = parsed.required(1)?;
-    store.with_keyspace(|ks| {
-        let removed = match ks.get_as(key, DataType::as_sorted_set)? {
-            Some(zset) => zset.remove(member),
-            None => 0,
-        };
+    let removed = match ks.get_as(key, DataType::as_sorted_set)? {
+        Some(zset) => zset.remove(member),
+        None => 0,
+    };
+    if removed > 0 {
         ks.remove_if_empty(key);
-        Ok(RespValue::Integer(removed as i64))
-    })
+        changes.wrote(key);
+    }
+    Ok(RespValue::Integer(removed as i64))
 }
 
 #[cfg(test)]

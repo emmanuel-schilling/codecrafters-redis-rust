@@ -17,10 +17,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub mod command;
 pub mod error;
+pub mod exec;
 pub mod geo;
 pub mod handlers;
 pub mod protocol;
@@ -41,9 +42,6 @@ pub struct AppContext {
     pub replication: Arc<ReplicationState>,
     pub pubsub: Arc<PubSubHub>,
     pub waiters: Arc<WaiterRegistry>,
-    /// Held while a write runs and is sent to replicas, so replicas receive
-    /// writes in the order this server applied them.
-    pub write_order: tokio::sync::Mutex<()>,
     pub watches: WatchRegistry,
 }
 
@@ -61,7 +59,6 @@ impl AppContext {
             replication,
             pubsub,
             waiters,
-            write_order: tokio::sync::Mutex::new(()),
             watches: WatchRegistry::new(),
         }
     }
@@ -69,7 +66,11 @@ impl AppContext {
 
 pub enum ConnectionState {
     Normal,
-    InTransaction,
+    /// Queuing a transaction's commands. `aborted` is set when a command is
+    /// rejected while queuing, which makes EXEC fail, as in Redis.
+    InTransaction {
+        aborted: bool,
+    },
     Subscribed {
         client_id: u64,
         subscriptions: HashSet<Bytes>,
@@ -118,6 +119,7 @@ async fn serve_client(stream: TcpStream, client_id: u64, ctx: &Arc<AppContext>) 
                 let parsed_command = match ParsedCommand::from_resp(value) {
                     Ok(cmd) => cmd,
                     Err(e) => {
+                        handlers::transaction::reject_while_queuing(&mut state);
                         if let Err(e) = framed.send(e.into()).await {
                             error!("failed to send error response: {e}");
                         }
@@ -217,15 +219,25 @@ async fn serve_client(stream: TcpStream, client_id: u64, ctx: &Arc<AppContext>) 
     }
 }
 
-/// Runs a write received from the master on a replica.
-pub async fn apply_command(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-    let _order = ctx.write_order.lock().await;
-    let written_key = parsed.written_key().cloned();
-    let response = handlers::dispatch(ctx, parsed).await;
-    if let (Some(key), false) = (written_key, matches!(response, RespValue::Error(_))) {
-        ctx.watches.touch(&key);
-    }
-    response
+/// Applies writes received from the master on a replica, together: a
+/// transaction's writes arrive wrapped in MULTI and EXEC, and no client sees
+/// the keyspace between them.
+pub fn apply_from_master(ctx: &AppContext, commands: &[ParsedCommand]) {
+    exec::locked_for_master(ctx, |ks, outbox| {
+        for parsed in commands {
+            let reply = match parsed.check_arity() {
+                Ok(()) => exec::run(ctx, ks, parsed, outbox),
+                Err(e) => e.into(),
+            };
+            if let RespValue::Error(e) = reply {
+                warn!(
+                    "Replica failed to apply write command {:?}: {}",
+                    parsed.command(),
+                    String::from_utf8_lossy(&e)
+                );
+            }
+        }
+    });
 }
 
 /// The reply to a write sent by a client to a replica.
@@ -242,63 +254,34 @@ pub async fn handle_command(
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
 ) -> RespValue {
+    if let Err(e) = parsed.check_arity() {
+        handlers::transaction::reject_while_queuing(state);
+        return e.into();
+    }
+
     if let Some(response) =
-        handlers::transaction::handle_state(&parsed, client_id, state, queue, ctx).await
+        handlers::transaction::handle_state(&parsed, client_id, state, queue, ctx)
     {
         return response;
     }
 
-    if matches!(state, ConnectionState::InTransaction) {
+    if matches!(state, ConnectionState::InTransaction { .. }) {
         queue.push(parsed);
         return RespValue::SimpleString(Bytes::from_static(b"QUEUED"));
     }
 
-    let command = parsed.command();
-    if command.is_write() && ctx.replication.role() == replication::Role::Replica {
+    if parsed.command().is_write() && ctx.replication.role() == replication::Role::Replica {
         return read_only_error();
     }
 
-    // BLPOP may block, so it can't hold the write-order lock while it waits;
-    // it takes the lock around each pop and propagates the pop itself.
-    if !command.is_write() || command == Command::BLPop {
-        return handlers::dispatch(ctx, parsed).await;
-    }
-
-    let _order = ctx.write_order.lock().await;
-    apply_write(ctx, parsed).await
-}
-
-/// Runs a write and, if it succeeds, marks its key changed for WATCH, sends
-/// it to replicas and serves clients blocked on a list it pushed to. The
-/// caller holds the write-order lock.
-pub(crate) async fn apply_write(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
-    let fed_list = matches!(parsed.command(), Command::LPush | Command::RPush)
-        .then(|| parsed.first().cloned())
-        .flatten();
-    let written_key = parsed.written_key().cloned();
-    let response = handlers::dispatch(ctx, parsed.clone()).await;
-    if let Some(propagated) = propagated_form(parsed, &response) {
-        if let Some(key) = written_key {
-            ctx.watches.touch(&key);
-        }
-        ctx.replication.propagate(propagated);
-        if let Some(key) = fed_list {
-            handlers::list::serve_blocked_clients(ctx, &key);
-        }
-    }
-    response
-}
-
-/// The command replicas apply for a write that replied `response`, or `None`
-/// if the write failed and changed nothing.
-fn propagated_form(parsed: ParsedCommand, response: &RespValue) -> Option<RespValue> {
-    match response {
-        RespValue::Error(_) => None,
-        // An ID generated here (`*` or `<ms>-*`) must be the same on replicas.
-        RespValue::BulkString(id) if parsed.command() == Command::XAdd => {
-            Some(parsed.with_arg(1, id.clone()).into_resp_array())
-        }
-        _ => Some(parsed.into_resp_array()),
+    // These can wait, so they lock the keyspace only while they look at it.
+    match parsed.command() {
+        Command::BLPop => handlers::list::blpop(&parsed, ctx).await,
+        Command::XRead => handlers::stream::xread(&parsed, ctx).await,
+        Command::Wait => handlers::replication::wait(&parsed, &ctx.replication)
+            .await
+            .unwrap_or_else(RespValue::from),
+        _ => exec::locked(ctx, |ks, outbox| exec::run(ctx, ks, &parsed, outbox)),
     }
 }
 
@@ -479,5 +462,185 @@ mod tests {
                 RespValue::Error(Bytes::from_static(b"ERR unknown command 'PSYNC'")),
             ])
         );
+    }
+
+    /// Runs `parts` as one client's transaction and returns EXEC's reply.
+    async fn transaction(ctx: &Arc<AppContext>, client_id: u64, parts: &[&[&str]]) -> RespValue {
+        let (mut state, mut queue) = (ConnectionState::Normal, vec![]);
+        handle_command(command(&["MULTI"]), ctx, client_id, &mut state, &mut queue).await;
+        for p in parts {
+            handle_command(command(p), ctx, client_id, &mut state, &mut queue).await;
+        }
+        handle_command(command(&["EXEC"]), ctx, client_id, &mut state, &mut queue).await
+    }
+
+    #[tokio::test]
+    async fn writes_that_change_nothing_are_not_sent_and_do_not_fail_watchers() {
+        let (ctx, mut rx) = master_with_replica();
+        run(&["ZADD", "z", "1", "a"], &ctx).await;
+        run(&["SETBIT", "b", "3", "1"], &ctx).await;
+        received(&mut rx);
+
+        let (mut state, mut queue) = (ConnectionState::Normal, vec![]);
+        handle_command(
+            command(&["WATCH", "z", "b", "l", "d"]),
+            &ctx,
+            1,
+            &mut state,
+            &mut queue,
+        )
+        .await;
+        for parts in [
+            &["LPOP", "l"][..],
+            &["LPOP", "l", "2"],
+            &["ZREM", "z", "missing"],
+            &["ZADD", "z", "1", "a"],
+            &["SETBIT", "b", "3", "1"],
+            &["SETBIT", "b", "0", "0"],
+            &["BITOP", "AND", "d", "missing"],
+            &["BLPOP", "l", "0.001"],
+        ] {
+            run(parts, &ctx).await;
+        }
+        assert_eq!(received(&mut rx), vec![]);
+        assert_eq!(transaction(&ctx, 1, &[]).await, RespValue::Array(vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_transaction_reaches_replicas_wrapped_in_multi_and_exec() {
+        let (ctx, mut rx) = master_with_replica();
+        transaction(
+            &ctx,
+            1,
+            &[&["SET", "a", "1"], &["GET", "a"], &["INCR", "a"]],
+        )
+        .await;
+        // A single write needs no wrapping.
+        transaction(&ctx, 1, &[&["SET", "b", "1"], &["GET", "b"]]).await;
+        let expected: Vec<RespValue> = [
+            &["MULTI"][..],
+            &["SET", "a", "1"],
+            &["INCR", "a"],
+            &["EXEC"],
+            &["SET", "b", "1"],
+        ]
+        .into_iter()
+        .map(|parts| command(parts).into_resp_array())
+        .collect();
+        assert_eq!(received(&mut rx), expected);
+    }
+
+    #[tokio::test]
+    async fn wait_in_a_transaction_replies_at_once() {
+        let (ctx, _rx) = master_with_replica();
+        run(&["SET", "a", "1"], &ctx).await;
+        assert_eq!(
+            transaction(&ctx, 1, &[&["WAIT", "1", "0"]]).await,
+            RespValue::Array(vec![RespValue::Integer(0)])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_command_sees_a_transaction_half_done() {
+        let ctx = test_context();
+        // Each transaction creates both keys or deletes both.
+        let writer = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                for _ in 0..500 {
+                    transaction(&ctx, 1, &[&["RPUSH", "a", "x"], &["RPUSH", "b", "x"]]).await;
+                    transaction(&ctx, 1, &[&["LPOP", "a"], &["LPOP", "b"]]).await;
+                }
+            })
+        };
+        while !writer.is_finished() {
+            let RespValue::Array(keys) = run(&["KEYS", "*"], &ctx).await else {
+                panic!("KEYS failed");
+            };
+            assert!(keys.len() != 1, "saw {keys:?}");
+        }
+        writer.await.expect("writer");
+    }
+
+    /// A Unix time in milliseconds, `offset_ms` from now, as a SET PXAT argument.
+    fn unix_ms(offset_ms: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+        (now + offset_ms).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_master_sends_del_for_a_key_it_finds_expired() {
+        let (ctx, mut rx) = master_with_replica();
+        let past = unix_ms(-1000);
+        run(&["SET", "a", "1", "PXAT", &past], &ctx).await;
+        run(&["SET", "b", "1", "PXAT", &past], &ctx).await;
+        received(&mut rx);
+
+        assert_eq!(run(&["GET", "a"], &ctx).await, RespValue::NullBulkString);
+        assert_eq!(run(&["INCR", "b"], &ctx).await, RespValue::Integer(1));
+        assert_eq!(
+            received(&mut rx),
+            [&["DEL", "a"][..], &["DEL", "b"], &["INCR", "b"]]
+                .into_iter()
+                .map(|parts| command(parts).into_resp_array())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn del_deletes_the_keys_that_exist() {
+        let (ctx, mut rx) = master_with_replica();
+        run(&["SET", "a", "1"], &ctx).await;
+        run(&["RPUSH", "b", "x"], &ctx).await;
+        received(&mut rx);
+        assert_eq!(
+            run(&["DEL", "a", "b", "c"], &ctx).await,
+            RespValue::Integer(2)
+        );
+        assert_eq!(run(&["DEL", "a"], &ctx).await, RespValue::Integer(0));
+        assert_eq!(
+            received(&mut rx),
+            vec![command(&["DEL", "a", "b", "c"]).into_resp_array()]
+        );
+        assert_eq!(run(&["KEYS", "*"], &ctx).await, RespValue::Array(vec![]));
+    }
+
+    #[tokio::test]
+    async fn a_replica_keeps_expired_keys_until_its_master_deletes_them() {
+        let config = Arc::new(<Config as clap::Parser>::parse_from([
+            "redis",
+            "--replicaof",
+            "localhost 6379",
+        ]));
+        let ctx = Arc::new(AppContext::new(
+            Arc::new(Store::new()),
+            Arc::clone(&config),
+            Arc::new(ReplicationState::new_from_config(&config)),
+            Arc::new(PubSubHub::new()),
+            Arc::new(WaiterRegistry::new()),
+        ));
+        apply_from_master(
+            &ctx,
+            &[command(&["SET", "n", "41", "PXAT", &unix_ms(-1000)])],
+        );
+
+        // Its clients don't see the key.
+        assert_eq!(run(&["GET", "n"], &ctx).await, RespValue::NullBulkString);
+        assert_eq!(run(&["KEYS", "*"], &ctx).await, RespValue::Array(vec![]));
+        // The master's writes still do, until it sends DEL.
+        apply_from_master(&ctx, &[command(&["INCR", "n"])]);
+        let stored = |ctx: &AppContext| {
+            ctx.store.with_keyspace(|ks| {
+                ks.set_expiry(store::Expiry::Ignore);
+                ks.get(&Bytes::from_static(b"n"))
+                    .and_then(|data| data.as_string().cloned())
+            })
+        };
+        assert_eq!(stored(&ctx), Some(Bytes::from_static(b"42")));
+        apply_from_master(&ctx, &[command(&["DEL", "n"])]);
+        assert_eq!(stored(&ctx), None);
     }
 }

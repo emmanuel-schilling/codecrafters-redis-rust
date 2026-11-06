@@ -106,6 +106,11 @@ impl WaiterRegistry {
         }
     }
 
+    /// Whether any BLPOP client is blocked on `key`.
+    pub fn blocked_on_list(&self, key: &Bytes) -> bool {
+        lock(&self.lists).contains_key(key)
+    }
+
     /// Hands elements from the front of `list` to clients blocked on `key`,
     /// oldest client first, until either runs out. Returns how many were handed over.
     pub fn serve_list(&self, key: &Bytes, list: &mut VecDeque<Bytes>) -> usize {

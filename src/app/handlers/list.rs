@@ -1,9 +1,10 @@
 use crate::app::{
     command::{parse, Command, ParsedCommand},
     error::AppError,
+    exec::{self, Changes},
     handlers::Reply,
     protocol::RespValue,
-    store::{resolve_range, DataType, Store},
+    store::{resolve_range, DataType, Keyspace},
     wait::Popped,
     AppContext,
 };
@@ -17,24 +18,22 @@ pub enum End {
     Back,
 }
 
-pub fn push(parsed: &ParsedCommand, store: &Store, end: End) -> Reply {
+pub fn push(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes, end: End) -> Reply {
     let key = parsed.required(0)?;
-    parsed.required(1)?;
     let values = parsed.args_from(1);
-    store.with_keyspace(|ks| {
-        let list =
-            ks.get_or_create_as(key, DataType::as_list, || DataType::List(VecDeque::new()))?;
-        for value in values {
-            match end {
-                End::Front => list.push_front(value.clone()),
-                End::Back => list.push_back(value.clone()),
-            }
+    let list = ks.get_or_create_as(key, DataType::as_list, || DataType::List(VecDeque::new()))?;
+    for value in values {
+        match end {
+            End::Front => list.push_front(value.clone()),
+            End::Back => list.push_back(value.clone()),
         }
-        Ok(RespValue::Integer(list.len() as i64))
-    })
+    }
+    let len = list.len();
+    changes.wrote(key);
+    Ok(RespValue::Integer(len as i64))
 }
 
-pub fn lpop(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn lpop(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let key = parsed.required(0)?;
     // With a count, LPOP always replies with an array (or a null array).
     let count = match parsed.arg(1) {
@@ -44,40 +43,42 @@ pub fn lpop(parsed: &ParsedCommand, store: &Store) -> Reply {
         })?),
     };
 
-    store.with_keyspace(|ks| {
-        let Some(list) = ks.get_as(key, DataType::as_list)? else {
-            return Ok(match count {
-                Some(_) => RespValue::NullArray,
-                None => RespValue::NullBulkString,
-            });
-        };
-        let reply = match count {
-            None => list
-                .pop_front()
-                .map_or(RespValue::NullBulkString, RespValue::BulkString),
-            Some(count) => RespValue::Array(
-                list.drain(..count.min(list.len()))
-                    .map(RespValue::BulkString)
-                    .collect(),
-            ),
-        };
+    let Some(list) = ks.get_as(key, DataType::as_list)? else {
+        return Ok(match count {
+            Some(_) => RespValue::NullArray,
+            None => RespValue::NullBulkString,
+        });
+    };
+    let popped: Vec<Bytes> = list.drain(..count.unwrap_or(1).min(list.len())).collect();
+    if !popped.is_empty() {
         ks.remove_if_empty(key);
-        Ok(reply)
+        changes.wrote(key);
+    }
+    Ok(match count {
+        None => popped
+            .into_iter()
+            .next()
+            .map_or(RespValue::NullBulkString, RespValue::BulkString),
+        Some(_) => RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect()),
     })
 }
 
-pub async fn blpop(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
-    let (keys, timeout) = blpop_args(parsed)?;
-
-    // Check and register under the write-order lock, which every push also
-    // holds: a push either lands first (and is popped here) or after (and
-    // hands its element to this client).
-    let mut wait = {
-        let _order = ctx.write_order.lock().await;
-        if let Some(popped) = pop_first(ctx, keys) {
-            return Ok(blpop_reply(popped));
-        }
-        ctx.waiters.block_on_lists(keys)
+/// BLPOP key [key ...] timeout: pops from the first non-empty list, or waits
+/// for an element until the timeout (0 waits forever).
+pub async fn blpop(parsed: &ParsedCommand, ctx: &AppContext) -> RespValue {
+    let (keys, timeout) = match blpop_args(parsed) {
+        Ok(args) => args,
+        Err(e) => return e.into(),
+    };
+    // Try and register in one locked section: every push runs locked too, so
+    // it either lands first (and is popped here) or after (and hands its
+    // element to this client).
+    let mut wait = match exec::locked(ctx, |ks, outbox| match exec::run(ctx, ks, parsed, outbox) {
+        RespValue::NullArray => Err(ctx.waiters.block_on_lists(keys)),
+        reply => Ok(reply),
+    }) {
+        Ok(reply) => return reply,
+        Err(wait) => wait,
     };
 
     let delivered = match timeout {
@@ -89,24 +90,33 @@ pub async fn blpop(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
             Err(_) => (&mut wait.delivery).await.ok(),
         },
     };
-    Ok(delivered.map_or(RespValue::NullArray, blpop_reply))
+    delivered.map_or(RespValue::NullArray, blpop_reply)
 }
 
-/// BLPOP inside a transaction, which doesn't block, as in Redis: it pops at
-/// once or replies with a null array. The caller holds the write-order lock.
-pub fn blpop_now(parsed: &ParsedCommand, ctx: &AppContext) -> Reply {
+/// BLPOP without waiting, as inside a transaction: pops from the first
+/// non-empty list (keys of other types are skipped) or replies with a null
+/// array. Replicas apply the pop as LPOP, which never blocks there.
+pub fn blpop_now(parsed: &ParsedCommand, ks: &mut Keyspace, changes: &mut Changes) -> Reply {
     let (keys, _) = blpop_args(parsed)?;
-    Ok(pop_first(ctx, keys).map_or(RespValue::NullArray, blpop_reply))
+    for key in keys {
+        if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
+            if let Some(value) = list.pop_front() {
+                ks.remove_if_empty(key);
+                changes.wrote(key);
+                changes.replicate_as(vec![exec::lpop(key)]);
+                return Ok(blpop_reply((key.clone(), value)));
+            }
+        }
+    }
+    Ok(RespValue::NullArray)
 }
 
 /// BLPOP's keys and timeout (`None` to wait forever).
 fn blpop_args(parsed: &ParsedCommand) -> Result<(&[Bytes], Option<Duration>), AppError> {
-    let Some((timeout_str, keys)) = parsed.args_from(0).split_last() else {
-        return Err(AppError::WrongArity(Command::BLPop));
-    };
-    if keys.is_empty() {
-        return Err(AppError::WrongArity(Command::BLPop));
-    }
+    let (timeout_str, keys) = parsed
+        .args_from(0)
+        .split_last()
+        .ok_or(AppError::WrongArity(Command::BLPop))?;
 
     let invalid_timeout = || AppError::ValueError("timeout is not a float or out of range".into());
     let timeout = match parse::<f64>(timeout_str) {
@@ -125,85 +135,31 @@ fn blpop_reply((key, value): Popped) -> RespValue {
     ])
 }
 
-/// The LPOP that replicas apply for an element popped from `key` by BLPOP.
-fn lpop_for_replicas(key: &Bytes) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"LPOP")),
-        RespValue::BulkString(key.clone()),
-    ])
-}
-
-/// Pops from the first key holding a non-empty list (keys of other types are
-/// skipped), marks the key changed for WATCH, and sends the pop to replicas
-/// as LPOP, which never blocks there.
-/// The caller holds the write-order lock.
-fn pop_first(ctx: &AppContext, keys: &[Bytes]) -> Option<Popped> {
-    let popped = ctx.store.with_keyspace(|ks| {
-        for key in keys {
-            if let Ok(Some(list)) = ks.get_as(key, DataType::as_list) {
-                if let Some(value) = list.pop_front() {
-                    ks.remove_if_empty(key);
-                    return Some((key.clone(), value));
-                }
-            }
-        }
-        None
-    });
-    if let Some((key, _)) = &popped {
-        ctx.watches.touch(key);
-        ctx.replication.propagate(lpop_for_replicas(key));
-    }
-    popped
-}
-
-/// Hands elements of `key` to clients blocked on it, oldest first, as Redis
-/// does right after a command that adds to a list. Each hand-over is sent to
-/// replicas as LPOP. The caller holds the write-order lock and has already
-/// propagated the command that added the elements.
-pub fn serve_blocked_clients(ctx: &AppContext, key: &Bytes) {
-    let served = ctx.store.with_keyspace(|ks| {
-        let Ok(Some(list)) = ks.get_as(key, DataType::as_list) else {
-            return 0;
-        };
-        let served = ctx.waiters.serve_list(key, list);
-        ks.remove_if_empty(key);
-        served
-    });
-    for _ in 0..served {
-        ctx.replication.propagate(lpop_for_replicas(key));
-    }
-}
-
-pub fn llen(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn llen(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
-    store.with_keyspace(|ks| {
-        let len = ks
-            .get_as(key, DataType::as_list)?
-            .map_or(0, |list| list.len());
-        Ok(RespValue::Integer(len as i64))
-    })
+    let len = ks
+        .get_as(key, DataType::as_list)?
+        .map_or(0, |list| list.len());
+    Ok(RespValue::Integer(len as i64))
 }
 
-pub fn lrange(parsed: &ParsedCommand, store: &Store) -> Reply {
+pub fn lrange(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     let key = parsed.required(0)?;
-    parsed.required(2)?;
     let start: i64 = parsed.integer(1)?;
     let stop: i64 = parsed.integer(2)?;
 
-    store.with_keyspace(|ks| {
-        let items = match ks.get_as(key, DataType::as_list)? {
-            Some(list) => resolve_range(start, stop, list.len())
-                .map(|(first, last)| {
-                    list.range(first..=last)
-                        .cloned()
-                        .map(RespValue::BulkString)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            None => vec![],
-        };
-        Ok(RespValue::Array(items))
-    })
+    let items = match ks.get_as(key, DataType::as_list)? {
+        Some(list) => resolve_range(start, stop, list.len())
+            .map(|(first, last)| {
+                list.range(first..=last)
+                    .cloned()
+                    .map(RespValue::BulkString)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => vec![],
+    };
+    Ok(RespValue::Array(items))
 }
 
 #[cfg(test)]
