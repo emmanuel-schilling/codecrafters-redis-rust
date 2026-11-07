@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
+pub mod aof;
 pub mod command;
 pub mod error;
 pub mod exec;

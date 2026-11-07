@@ -3,7 +3,8 @@ use clap::Parser;
 use codecrafters_redis::{
     app,
     app::{
-        pubsub::PubSubHub, rdb, replication::ReplicationState, store::Store, wait::WaiterRegistry,
+        aof, pubsub::PubSubHub, rdb, replication::ReplicationState, store::Store,
+        wait::WaiterRegistry,
     },
     config::Config,
     foundation::{net, shutdown},
@@ -24,6 +25,8 @@ async fn main() -> Result<()> {
         std::process::id(),
         config.listen_addr()
     );
+
+    aof::prepare(&config)?;
 
     let store = Arc::new(Store::new());
     match rdb::load(&config) {
