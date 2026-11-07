@@ -7,6 +7,7 @@ use crate::app::{
 };
 use bytes::Bytes;
 
+pub mod acl;
 pub mod bitmap;
 pub mod connection;
 pub mod geo;
@@ -79,6 +80,8 @@ pub fn execute(
         Command::BitOp => bitmap::bitop(parsed, ks, changes),
 
         Command::Publish => pubsub::publish(parsed, &ctx.pubsub),
+
+        Command::Acl => acl::acl(parsed),
 
         // Only reached inside EXEC, which has already cleared the watches.
         Command::Unwatch => Ok(RespValue::SimpleString(Bytes::from_static(b"OK"))),

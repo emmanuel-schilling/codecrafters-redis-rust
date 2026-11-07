@@ -54,6 +54,8 @@ pub enum Command {
     GetBit,
     BitCount,
     BitOp,
+    // Access Control
+    Acl,
 }
 
 impl Command {
@@ -79,6 +81,7 @@ impl Command {
             Command::LRange | Command::SetBit => 4,
             Command::Ping | Command::Info | Command::ReplConf | Command::Unsubscribe => -1,
             Command::Config
+            | Command::Acl
             | Command::Watch
             | Command::Del
             | Command::LPop
@@ -245,13 +248,13 @@ mod tests {
     #[test]
     fn unknown_commands_get_an_err_reply() {
         let unknown = RespValue::Array(vec![
-            RespValue::BulkString(Bytes::from_static(b"ACL")),
-            RespValue::BulkString(Bytes::from_static(b"WHOAMI")),
+            RespValue::BulkString(Bytes::from_static(b"NOSUCHCOMMAND")),
+            RespValue::BulkString(Bytes::from_static(b"ARG")),
         ]);
-        let error = ParsedCommand::from_resp(unknown).expect_err("ACL is not supported");
+        let error = ParsedCommand::from_resp(unknown).expect_err("NOSUCHCOMMAND is unknown");
         assert_eq!(
             RespValue::from(error),
-            RespValue::Error(Bytes::from_static(b"ERR unknown command 'ACL'"))
+            RespValue::Error(Bytes::from_static(b"ERR unknown command 'NOSUCHCOMMAND'"))
         );
     }
 
