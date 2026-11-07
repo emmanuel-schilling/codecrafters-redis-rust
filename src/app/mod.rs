@@ -44,6 +44,8 @@ pub struct AppContext {
     pub pubsub: Arc<PubSubHub>,
     pub waiters: Arc<WaiterRegistry>,
     pub watches: WatchRegistry,
+    /// The AOF file applied writes are appended to, when AOF is enabled.
+    pub aof: Option<aof::Aof>,
 }
 
 impl AppContext {
@@ -61,7 +63,14 @@ impl AppContext {
             pubsub,
             waiters,
             watches: WatchRegistry::new(),
+            aof: None,
         }
+    }
+
+    /// Appends applied writes to `aof`.
+    pub fn with_aof(mut self, aof: Option<aof::Aof>) -> Self {
+        self.aof = aof;
+        self
     }
 }
 
@@ -284,6 +293,13 @@ pub async fn handle_command(
             .unwrap_or_else(RespValue::from),
         _ => exec::locked(ctx, |ks, outbox| exec::run(ctx, ks, &parsed, outbox)),
     }
+}
+
+/// A master's context with default config that appends writes to `aof`, for unit tests.
+#[cfg(test)]
+pub(crate) fn test_context_with_aof(aof: aof::Aof) -> Arc<AppContext> {
+    let ctx = Arc::into_inner(test_context()).expect("only reference");
+    Arc::new(ctx.with_aof(Some(aof)))
 }
 
 /// Builds a command from its parts, for unit tests.

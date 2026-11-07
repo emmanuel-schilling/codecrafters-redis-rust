@@ -3,7 +3,7 @@ use clap::Parser;
 use codecrafters_redis::{
     app,
     app::{
-        aof, pubsub::PubSubHub, rdb, replication::ReplicationState, store::Store,
+        aof::Aof, pubsub::PubSubHub, rdb, replication::ReplicationState, store::Store,
         wait::WaiterRegistry,
     },
     config::Config,
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
         config.listen_addr()
     );
 
-    aof::prepare(&config)?;
+    let aof = Aof::open(&config)?;
 
     let store = Arc::new(Store::new());
     match rdb::load(&config) {
@@ -49,13 +49,16 @@ async fn main() -> Result<()> {
     let waiters = Arc::new(WaiterRegistry::new());
     let pubsub_hub = Arc::new(PubSubHub::new());
 
-    let ctx = Arc::new(app::AppContext::new(
-        Arc::clone(&store),
-        Arc::clone(&config),
-        replication_state,
-        pubsub_hub,
-        waiters,
-    ));
+    let ctx = Arc::new(
+        app::AppContext::new(
+            Arc::clone(&store),
+            Arc::clone(&config),
+            replication_state,
+            pubsub_hub,
+            waiters,
+        )
+        .with_aof(aof),
+    );
 
     if ctx.replication.role() == app::replication::Role::Replica {
         let master_addr = ctx.config.replicaof.clone().unwrap();

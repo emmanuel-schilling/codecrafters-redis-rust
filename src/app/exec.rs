@@ -37,7 +37,7 @@ impl Changes {
     }
 }
 
-/// Commands for replicas, in the order they were applied here.
+/// Commands for replicas and the AOF, in the order they were applied here.
 pub type Outbox = Vec<RespValue>;
 
 /// Runs `f` for a client with the keyspace locked, then sends replicas what
@@ -69,6 +69,11 @@ fn locked_with<R>(
         let mut outbox = Outbox::new();
         let result = f(ks, &mut outbox);
         send_expired(ks, &mut outbox);
+        // Appended before the client is replied to, so with `appendfsync
+        // always` an acknowledged write is already on disk.
+        if let Some(aof) = &ctx.aof {
+            aof.append(&outbox);
+        }
         // A replica's writes come from its master; it has no replicas of its own.
         if ctx.replication.role() == Role::Master {
             for command in outbox {
