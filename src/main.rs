@@ -49,16 +49,19 @@ async fn main() -> Result<()> {
     let waiters = Arc::new(WaiterRegistry::new());
     let pubsub_hub = Arc::new(PubSubHub::new());
 
-    let ctx = Arc::new(
-        app::AppContext::new(
-            Arc::clone(&store),
-            Arc::clone(&config),
-            replication_state,
-            pubsub_hub,
-            waiters,
-        )
-        .with_aof(aof),
+    let ctx = app::AppContext::new(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        replication_state,
+        pubsub_hub,
+        waiters,
     );
+    if let Some(aof) = &aof {
+        let commands = aof.commands()?;
+        app::exec::replay(&ctx, &commands);
+        info!("AOF replayed, {} commands.", commands.len());
+    }
+    let ctx = Arc::new(ctx.with_aof(aof));
 
     if ctx.replication.role() == app::replication::Role::Replica {
         let master_addr = ctx.config.replicaof.clone().unwrap();

@@ -6,7 +6,7 @@
 //! replicas receive, and the clients they serve all follow one order.
 
 use crate::app::{
-    command::ParsedCommand,
+    command::{Command, ParsedCommand},
     handlers,
     protocol::RespValue,
     replication::Role,
@@ -14,6 +14,7 @@ use crate::app::{
     AppContext,
 };
 use bytes::Bytes;
+use tracing::warn;
 
 /// What one command changed, recorded by its handler.
 #[derive(Debug, Default)]
@@ -82,6 +83,35 @@ fn locked_with<R>(
         }
         result
     })
+}
+
+/// Applies the commands read back from the AOF at startup, before any client
+/// connects. As in Redis, keys don't expire while the file is replayed, and
+/// nothing replayed is written back to the AOF or sent to replicas. A
+/// transaction's MULTI and EXEC are skipped: the replay runs in one locked
+/// section anyway.
+pub fn replay(ctx: &AppContext, commands: &[ParsedCommand]) {
+    ctx.store.with_keyspace(|ks| {
+        ks.set_expiry(Expiry::Ignore);
+        let mut discarded = Outbox::new();
+        for parsed in commands {
+            if matches!(parsed.command(), Command::Multi | Command::Exec) {
+                continue;
+            }
+            let reply = match parsed.check_arity() {
+                Ok(()) => run(ctx, ks, parsed, &mut discarded),
+                Err(e) => e.into(),
+            };
+            if let RespValue::Error(e) = reply {
+                warn!(
+                    "failed to replay {:?} from the AOF: {}",
+                    parsed.command(),
+                    String::from_utf8_lossy(&e)
+                );
+            }
+            discarded.clear();
+        }
+    });
 }
 
 /// Runs a command that doesn't wait (blocking commands reply at once) and

@@ -1,12 +1,16 @@
 //! The append-only file (AOF) and its manifest, in `<dir>/<appenddirname>`.
 
-use crate::app::protocol::RespValue;
+use crate::app::command::ParsedCommand;
+use crate::app::protocol::{RespDecoder, RespValue};
 use crate::config::Config;
+use anyhow::Context;
+use bytes::BytesMut;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
-use tracing::error;
+use tokio_util::codec::Decoder;
+use tracing::{error, warn};
 
 /// The name of the first incremental AOF file.
 fn incr_file_name(config: &Config) -> String {
@@ -58,6 +62,7 @@ pub fn prepare(config: &Config) -> io::Result<()> {
 /// The open incremental AOF file that applied writes are appended to.
 #[derive(Debug)]
 pub struct Aof {
+    path: PathBuf,
     file: Mutex<File>,
     /// Whether each append is flushed to disk before the client gets its reply.
     fsync_always: bool,
@@ -89,9 +94,45 @@ impl Aof {
     fn append_to(path: &Path, fsync_always: bool) -> io::Result<Self> {
         let file = OpenOptions::new().append(true).create(true).open(path)?;
         Ok(Self {
+            path: path.to_path_buf(),
             file: Mutex::new(file),
             fsync_always,
         })
+    }
+
+    /// The commands in the AOF file, in order, to replay at startup. Anything
+    /// in the file that isn't a valid command is an error, except that, as
+    /// with Redis's default `aof-load-truncated yes`, a file ending partway
+    /// through a command (as a crash mid-write leaves it) is cut back to the
+    /// last complete command.
+    pub fn commands(&self) -> anyhow::Result<Vec<ParsedCommand>> {
+        let context = || format!("reading the AOF file {}", self.path.display());
+        let contents = fs::read(&self.path).with_context(context)?;
+        let mut bytes = BytesMut::from(&contents[..]);
+        let mut commands = Vec::new();
+        while let Some(value) = RespDecoder.decode(&mut bytes).with_context(context)? {
+            commands.push(ParsedCommand::from_resp(value).with_context(context)?);
+        }
+        if !bytes.is_empty() {
+            // As in Redis, only the start of a command counts as truncated;
+            // anything else is a format error.
+            if bytes[0] != b'*' {
+                anyhow::bail!("{} is not a valid AOF file", self.path.display());
+            }
+            let complete = (contents.len() - bytes.len()) as u64;
+            warn!(
+                "!!! Warning: short read while loading the AOF file {}!!!",
+                self.path.display()
+            );
+            // A separate handle: a file opened only to append can't be cut on every platform.
+            OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|file| file.set_len(complete))
+                .with_context(context)?;
+            warn!("AOF loaded anyway because aof-load-truncated is enabled");
+        }
+        Ok(commands)
     }
 
     /// Appends `commands` in RESP form and, with `appendfsync always`, flushes
@@ -273,10 +314,68 @@ mod tests {
         fs::write(&path, "").expect("create file");
         // Opened for reading only, so every write fails.
         let aof = Aof {
+            path: path.clone(),
             file: Mutex::new(File::open(&path).expect("open")),
             fsync_always: true,
         };
         let set = crate::app::test_command(&["SET", "k", "v"]).into_resp_array();
         assert!(aof.write(&[set]).is_err());
+    }
+
+    /// An `Aof` on a file holding `contents`, in `tmp`.
+    fn aof_holding(tmp: &TempDir, contents: &[u8]) -> Aof {
+        let path = tmp.0.join("replay.1.incr.aof");
+        fs::write(&path, contents).expect("write aof");
+        Aof::append_to(&path, false).expect("open")
+    }
+
+    const COMMANDS: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n\
+        *3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n\
+        *1\r\n$5\r\nMULTI\r\n*2\r\n$4\r\nINCR\r\n$1\r\na\r\n*1\r\n$4\r\nEXEC\r\n";
+
+    #[tokio::test]
+    async fn replaying_restores_every_command_in_order() {
+        let tmp = TempDir::new("replay");
+        let aof = aof_holding(&tmp, COMMANDS);
+        let ctx = crate::app::test_context();
+        crate::app::exec::replay(&ctx, &aof.commands().expect("commands"));
+
+        let bulk = |v: &'static str| RespValue::BulkString(bytes::Bytes::from_static(v.as_bytes()));
+        assert_eq!(crate::app::run_test(&["GET", "a"], &ctx).await, bulk("2"));
+        assert_eq!(crate::app::run_test(&["GET", "b"], &ctx).await, bulk("2"));
+        // Nothing replayed is written back or sent to replicas.
+        assert_eq!(fs::read(&aof.path).expect("aof file"), COMMANDS);
+        assert_eq!(ctx.replication.master_repl_offset(), 0);
+    }
+
+    #[test]
+    fn a_file_ending_partway_through_a_command_is_cut_back_to_the_last_complete_one() {
+        let tmp = TempDir::new("truncated");
+        let complete = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+        let aof = aof_holding(&tmp, &[&complete[..], b"*3\r\n$3\r\nSET\r\n$1"].concat());
+        let commands = aof.commands().expect("commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(fs::read(&aof.path).expect("aof file"), complete);
+
+        // Later appends follow the last complete command.
+        let set = crate::app::test_command(&["SET", "b", "2"]).into_resp_array();
+        aof.append(std::slice::from_ref(&set));
+        assert_eq!(
+            fs::read(&aof.path).expect("aof file"),
+            [&complete[..], &set.encode_to_bytes()].concat()
+        );
+    }
+
+    #[test]
+    fn a_file_with_anything_but_valid_commands_is_an_error() {
+        let tmp = TempDir::new("bad");
+        for contents in [&b"+OK\r\n"[..], b"*1\r\n$7\r\nUNKNOWN\r\n", b"garbage"] {
+            assert!(
+                aof_holding(&tmp, contents).commands().is_err(),
+                "{:?}",
+                String::from_utf8_lossy(contents)
+            );
+        }
+        assert!(aof_holding(&tmp, b"").commands().expect("empty").is_empty());
     }
 }
