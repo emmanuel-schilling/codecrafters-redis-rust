@@ -1,5 +1,6 @@
 use crate::app::{
     command::{Command, ParsedCommand},
+    error::AppError,
     protocol::{RespDecoder, RespValue},
     pubsub::PubSubHub,
     replication::ReplicationState,
@@ -102,6 +103,9 @@ async fn serve_client(stream: TcpStream, client_id: u64, ctx: &Arc<AppContext>) 
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
     let mut command_queue: Vec<ParsedCommand> = Vec::new();
+    // A new connection is authenticated as the default user only while it has
+    // `nopass`; one already authenticated stays so when a password is set.
+    let mut authenticated = ctx.acl.nopass();
 
     loop {
         if let ConnectionState::Subscribed {
@@ -139,6 +143,31 @@ async fn serve_client(stream: TcpStream, client_id: u64, ctx: &Arc<AppContext>) 
                         continue;
                     }
                 };
+
+                if parsed_command.command() == Command::Auth {
+                    let reply = parsed_command
+                        .check_arity()
+                        .and_then(|()| handlers::acl::auth(&parsed_command, &ctx.acl));
+                    authenticated |= reply.is_ok();
+                    if let Err(e) = framed.send(reply.unwrap_or_else(RespValue::from)).await {
+                        error!("failed to send AUTH response: {e}");
+                        return;
+                    }
+                    continue;
+                }
+
+                if !authenticated {
+                    // As in Redis, a wrong number of arguments is reported first.
+                    let reply = parsed_command
+                        .check_arity()
+                        .err()
+                        .unwrap_or(AppError::NoAuth);
+                    if let Err(e) = framed.send(reply.into()).await {
+                        error!("failed to send NOAUTH response: {e}");
+                        return;
+                    }
+                    continue;
+                }
 
                 if parsed_command.command() == Command::Subscribe {
                     let rx = ctx.pubsub.register(client_id);
@@ -662,5 +691,81 @@ mod tests {
         assert_eq!(stored(&ctx), Some(Bytes::from_static(b"42")));
         apply_from_master(&ctx, &[command(&["DEL", "n"])]);
         assert_eq!(stored(&ctx), None);
+    }
+
+    /// Serves connections on a local port, as the server does, and returns its address.
+    async fn serve() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = test_context();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(handle_connection(stream, Arc::clone(&ctx)));
+            }
+        });
+        addr
+    }
+
+    /// A client connection that sends commands and returns each reply.
+    struct Client(Framed<TcpStream, RespDecoder>);
+
+    impl Client {
+        async fn connect(addr: std::net::SocketAddr) -> Self {
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            Self(Framed::new(stream, RespDecoder))
+        }
+
+        async fn call(&mut self, parts: &[&str]) -> RespValue {
+            self.0
+                .send(command(parts).into_resp_array())
+                .await
+                .expect("send");
+            self.0.next().await.expect("reply").expect("decode")
+        }
+    }
+
+    #[tokio::test]
+    async fn once_a_password_is_set_new_connections_must_authenticate() {
+        let addr = serve().await;
+        let simple = |s: &'static str| RespValue::SimpleString(Bytes::from_static(s.as_bytes()));
+        let error = |s: &'static str| RespValue::Error(Bytes::from_static(s.as_bytes()));
+        let noauth = error("NOAUTH Authentication required.");
+        let default = RespValue::BulkString(Bytes::from_static(b"default"));
+
+        let mut first = Client::connect(addr).await;
+        assert_eq!(
+            first
+                .call(&["ACL", "SETUSER", "default", ">newpassword"])
+                .await,
+            simple("OK")
+        );
+        assert_eq!(first.call(&["ACL", "WHOAMI"]).await, default);
+
+        let mut second = Client::connect(addr).await;
+        for parts in [
+            &["ACL", "WHOAMI"][..],
+            &["PING"],
+            &["SUBSCRIBE", "c"],
+            &["MULTI"],
+        ] {
+            assert_eq!(second.call(parts).await, noauth, "{parts:?}");
+        }
+        assert_eq!(
+            second.call(&["GET"]).await,
+            error("ERR wrong number of arguments for 'get' command")
+        );
+        assert_eq!(
+            second.call(&["AUTH", "default", "wrongpassword"]).await,
+            error("WRONGPASS invalid username-password pair or user is disabled.")
+        );
+        assert_eq!(second.call(&["PING"]).await, noauth);
+        assert_eq!(
+            second.call(&["AUTH", "default", "newpassword"]).await,
+            simple("OK")
+        );
+        assert_eq!(second.call(&["PING"]).await, simple("PONG"));
+        assert_eq!(second.call(&["ACL", "WHOAMI"]).await, default);
     }
 }

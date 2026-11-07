@@ -50,6 +50,22 @@ impl Acl {
         }
     }
 
+    /// Whether the default user has the `nopass` flag, so new connections are
+    /// authenticated as it without AUTH.
+    pub fn nopass(&self) -> bool {
+        self.user().nopass
+    }
+
+    /// Whether `password` authenticates a connection as `username`: with
+    /// `nopass` any password does, otherwise its hash must be one of the user's.
+    pub fn authenticates(&self, username: &[u8], password: &[u8]) -> bool {
+        if username != b"default" {
+            return false;
+        }
+        let user = self.user();
+        user.nopass || user.passwords.contains(&sha256_hex(password))
+    }
+
     /// The default user's flags and password hashes, as ACL GETUSER lists them.
     pub fn flags_and_passwords(&self) -> (Vec<&'static str>, Vec<String>) {
         let user = self.user();

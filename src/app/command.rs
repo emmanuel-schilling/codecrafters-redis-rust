@@ -56,6 +56,7 @@ pub enum Command {
     BitOp,
     // Access Control
     Acl,
+    Auth,
 }
 
 impl Command {
@@ -79,6 +80,7 @@ impl Command {
             | Command::ZCard => 2,
             Command::Wait | Command::Publish | Command::ZScore | Command::GetBit => 3,
             Command::LRange | Command::SetBit => 4,
+            Command::Auth => 3,
             Command::Ping | Command::Info | Command::ReplConf | Command::Unsubscribe => -1,
             Command::Config
             | Command::Acl

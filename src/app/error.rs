@@ -39,4 +39,12 @@ pub enum AppError {
     /// Arguments that don't form a valid command.
     #[error("ERR syntax error")]
     Syntax,
+
+    /// AUTH was given a username and password that don't match.
+    #[error("WRONGPASS invalid username-password pair or user is disabled.")]
+    WrongPass,
+
+    /// A command from a connection that hasn't authenticated.
+    #[error("NOAUTH Authentication required.")]
+    NoAuth,
 }

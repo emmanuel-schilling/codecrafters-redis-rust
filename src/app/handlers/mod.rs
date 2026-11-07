@@ -86,8 +86,9 @@ pub fn execute(
         // Only reached inside EXEC, which has already cleared the watches.
         Command::Unwatch => Ok(RespValue::SimpleString(Bytes::from_static(b"OK"))),
 
-        // The connection loop handles these, and the transaction state handles
-        // MULTI, EXEC, DISCARD and WATCH, before a command is executed;
+        // The connection loop handles these (including AUTH), and the
+        // transaction state handles MULTI, EXEC, DISCARD and WATCH, before a
+        // command is executed;
         // anywhere else (queued in a transaction, or sent by a master) they're
         // unknown.
         Command::PSync
@@ -96,7 +97,8 @@ pub fn execute(
         | Command::Multi
         | Command::Exec
         | Command::Discard
-        | Command::Watch => Err(AppError::UnknownCommand(parsed.command().to_string())),
+        | Command::Watch
+        | Command::Auth => Err(AppError::UnknownCommand(parsed.command().to_string())),
     };
     reply.unwrap_or_else(RespValue::from)
 }

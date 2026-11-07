@@ -6,6 +6,16 @@ use crate::app::{
 };
 use bytes::Bytes;
 
+/// AUTH username password: OK if the password authenticates as the user,
+/// otherwise WRONGPASS. The connection loop records the result.
+pub fn auth(parsed: &ParsedCommand, acl: &Acl) -> Reply {
+    if acl.authenticates(parsed.required(0)?, parsed.required(1)?) {
+        Ok(RespValue::SimpleString(Bytes::from_static(b"OK")))
+    } else {
+        Err(AppError::WrongPass)
+    }
+}
+
 /// ACL WHOAMI | ACL GETUSER username | ACL SETUSER username [rule ...].
 pub fn acl(parsed: &ParsedCommand, acl: &Acl) -> Reply {
     let subcommand = parsed.required(0)?;
@@ -192,5 +202,22 @@ mod tests {
             run(&["ACL", "GETUSER", "default"], &ctx).await,
             user(&["nopass"], &[])
         );
+    }
+
+    #[test]
+    fn auth_accepts_any_password_with_nopass_and_then_only_a_set_one() {
+        let acl = crate::app::acl::Acl::new();
+        let auth = |user: &str, password: &str| {
+            super::auth(&crate::app::test_command(&["AUTH", user, password]), &acl)
+                .unwrap_or_else(RespValue::from)
+        };
+        let ok = RespValue::SimpleString(Bytes::from_static(b"OK"));
+        let wrongpass = error("WRONGPASS invalid username-password pair or user is disabled.");
+        assert_eq!(auth("default", "anything"), ok);
+        assert_eq!(auth("alice", "anything"), wrongpass);
+
+        acl.add_password(b"mypassword");
+        assert_eq!(auth("default", "wrongpassword"), wrongpass);
+        assert_eq!(auth("default", "mypassword"), ok);
     }
 }
