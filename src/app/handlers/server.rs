@@ -39,6 +39,10 @@ pub fn config(parsed: &ParsedCommand, config: &Config) -> Reply {
     let value = match key.to_lowercase().as_str() {
         "dir" => config.dir.to_string_lossy().into_owned(),
         "dbfilename" => config.dbfilename.clone(),
+        "appendonly" => config.appendonly.clone(),
+        "appenddirname" => config.appenddirname.clone(),
+        "appendfilename" => config.appendfilename.clone(),
+        "appendfsync" => config.appendfsync.clone(),
         _ => return Ok(RespValue::Array(vec![])),
     };
     Ok(RespValue::Array(vec![
@@ -57,4 +61,40 @@ pub fn keys(parsed: &ParsedCommand, ks: &mut Keyspace) -> Reply {
     Ok(RespValue::Array(
         keys.into_iter().map(RespValue::BulkString).collect(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::{run_test as run, test_context, RespValue};
+    use bytes::Bytes;
+
+    fn pair(name: &str, value: &str) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::BulkString(Bytes::copy_from_slice(name.as_bytes())),
+            RespValue::BulkString(Bytes::copy_from_slice(value.as_bytes())),
+        ])
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_the_aof_options_and_dir() {
+        let ctx = test_context();
+        let cwd = std::env::current_dir().expect("current dir");
+        let cases = [
+            ("dir", cwd.to_string_lossy().into_owned()),
+            ("appendonly", "no".into()),
+            ("appenddirname", "appendonlydir".into()),
+            ("appendfilename", "appendonly.aof".into()),
+            ("appendfsync", "everysec".into()),
+        ];
+        for (name, value) in cases {
+            assert_eq!(
+                run(&["CONFIG", "GET", name], &ctx).await,
+                pair(name, &value)
+            );
+        }
+        assert_eq!(
+            run(&["CONFIG", "GET", "unknown"], &ctx).await,
+            RespValue::Array(vec![])
+        );
+    }
 }
