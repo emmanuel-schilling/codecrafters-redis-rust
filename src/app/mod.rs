@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
+pub mod acl;
 pub mod aof;
 pub mod command;
 pub mod error;
@@ -46,6 +47,7 @@ pub struct AppContext {
     pub watches: WatchRegistry,
     /// The AOF file applied writes are appended to, when AOF is enabled.
     pub aof: Option<aof::Aof>,
+    pub acl: acl::Acl,
 }
 
 impl AppContext {
@@ -64,6 +66,7 @@ impl AppContext {
             waiters,
             watches: WatchRegistry::new(),
             aof: None,
+            acl: acl::Acl::new(),
         }
     }
 

@@ -81,7 +81,7 @@ pub fn execute(
 
         Command::Publish => pubsub::publish(parsed, &ctx.pubsub),
 
-        Command::Acl => acl::acl(parsed),
+        Command::Acl => acl::acl(parsed, &ctx.acl),
 
         // Only reached inside EXEC, which has already cleared the watches.
         Command::Unwatch => Ok(RespValue::SimpleString(Bytes::from_static(b"OK"))),
